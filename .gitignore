@@ -1,0 +1,24 @@
+# Databases (runtime state — regenerated on each run)
+*.db
+*.db-shm
+*.db-wal
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environments
+.venv/
+venv/
+.env
+*.env
+
+# Test output
+*.log
+*.tmp
+
+# OS artifacts
+.DS_Store
