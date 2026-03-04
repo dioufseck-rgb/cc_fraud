@@ -248,12 +248,14 @@ class Coordinator:
 
         # Resolve governance tier — override takes precedence
         tier = governance_tier_override or self._resolve_governance_tier(domain)
+        tier_locked = bool(governance_tier_override)
 
         # Create instance
         instance = InstanceState.create(
             workflow_type=workflow_type,
             domain=domain,
             governance_tier=tier,
+            governance_tier_locked=tier_locked,
             lineage=lineage or [],
             correlation_id=correlation_id,
         )
@@ -788,7 +790,10 @@ class Coordinator:
         # ── Step 0: Quality Gate — Fail Closed ──
         # Check all step confidences against thresholds. If any step
         # is below the floor, escalate to HITL regardless of domain tier.
-        if not is_resume:
+        # Exception: if governance_tier was explicitly locked via delegation
+        # governance_tier_override, the quality gate must not escalate —
+        # the parent workflow's gate is the authoritative quality check.
+        if not is_resume and not instance.governance_tier_locked:
             qg = self._evaluate_quality_gate(instance, final_state)
             if qg:
                 self._log(f"  ⚠ QUALITY GATE FIRED: {qg['reason']}")
@@ -802,6 +807,9 @@ class Coordinator:
                 instance.governance_tier = qg["escalation_tier"]
                 # Stash for escalation brief
                 instance._quality_gate = qg
+        elif not is_resume and instance.governance_tier_locked:
+            self._log(f"  ℹ quality gate skipped — tier locked by delegation override "
+                       f"({instance.governance_tier})")
 
         # ── Step 1: Evaluate governance tier ──
         # Skip on resume: governance was already evaluated before suspension.
