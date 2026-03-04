@@ -457,6 +457,26 @@ class Coordinator:
         # Clean up suspension
         self.store.delete_suspension(instance_id)
 
+        # Mark the pending governance task as resolved. The CLI calls approve()
+        # directly without going through resolve_task(), so the task stays PENDING
+        # unless we close it here.
+        pending_tasks = self.tasks.list_tasks(
+            instance_id=instance_id, status=TaskStatus.PENDING
+        )
+        for task in pending_tasks:
+            if task.task_type == TaskType.GOVERNANCE_APPROVAL:
+                if isinstance(self.tasks, SQLiteTaskQueue):
+                    self.tasks.db.execute(
+                        "UPDATE task_queue SET status = 'completed', resolved_at = ?"
+                        " WHERE task_id = ?",
+                        (time.time(), task.task_id),
+                    )
+                    self.tasks.db.commit()
+                elif isinstance(self.tasks, InMemoryTaskQueue):
+                    task.status = TaskStatus.COMPLETED
+                    self.tasks._tasks[task.task_id] = task
+                break
+
         # Mark completed
         instance.status = InstanceStatus.COMPLETED
         instance.updated_at = time.time()
@@ -1084,21 +1104,14 @@ class Coordinator:
         ff_delegations = [d for d in new_delegations if d.mode != "wait_for_result"]
         blocking_delegations = [d for d in new_delegations if d.mode == "wait_for_result"]
 
-        if len(blocking_delegations) > 1:
-            self._log(f"  ⚠ {len(blocking_delegations)} blocking delegations — "
-                       f"will execute serially via suspend/resume chain")
-
         for deleg in ff_delegations:
             self._execute_delegation(instance, deleg, final_state)
 
-        # Only dispatch the first blocking delegation. When it completes, the
-        # source resumes and _on_completed fires again — the dedup guard skips
-        # already-fired policies and picks up the next blocking delegation.
-        # Dispatching all of them in the same loop would cause duplicates because
-        # the in-process handler runs synchronously and the resume chain already
-        # fires subsequent delegations before the loop reaches them.
+        # All blocking delegations are batched into a single suspension with
+        # multiple work_order_ids. The source resumes once — after ALL handlers
+        # complete — with combined results. No intermediate generate_final_report.
         if blocking_delegations:
-            self._execute_delegation(instance, blocking_delegations[0], final_state)
+            self._execute_all_blocking_delegations(instance, blocking_delegations, final_state)
 
     def _on_failed(self, instance: InstanceState, error: str):
         """Handle workflow failure."""
@@ -1762,6 +1775,218 @@ class Coordinator:
         )
 
     # ─── Delegation Execution ────────────────────────────────────────
+
+    def _execute_all_blocking_delegations(
+        self,
+        source: InstanceState,
+        decisions: list[DelegationDecision],
+        source_state: dict[str, Any],
+    ):
+        """
+        Dispatch all wait_for_result delegations under a single suspension.
+
+        Creates work orders for every decision, suspends the source once with
+        all work_order_ids, then starts each handler. Because the suspension
+        lists all WO IDs, _check_delegation_completion only resumes the source
+        after every handler has finished — no intermediate runs of
+        generate_final_report.
+
+        If any handler ends up suspended (governance gate), the source stays
+        suspended. When that handler is eventually approved, _check_delegation_
+        completion picks up all sibling WOs and resumes the source with the
+        combined results once everything is resolved.
+        """
+        # ── Build work orders ──────────────────────────────────────────
+        valid_pairs: list[tuple[DelegationDecision, WorkOrder]] = []
+        for decision in decisions:
+            errors = self.policy.validate_work_order_inputs(
+                decision.contract_name, decision.inputs
+            )
+            if errors:
+                self._log(f"  ⚠ delegation {decision.policy_name} skipped: "
+                           f"contract validation failed: {errors}")
+                self.store.log_action(
+                    instance_id=source.instance_id,
+                    correlation_id=source.correlation_id,
+                    action_type="delegation_skipped",
+                    details={"policy": decision.policy_name, "errors": errors},
+                )
+                continue
+
+            wo = WorkOrder.create(
+                requester_instance_id=source.instance_id,
+                correlation_id=source.correlation_id,
+                contract_name=decision.contract_name,
+                contract_version=decision.contract_version,
+                inputs=decision.inputs,
+                sla_seconds=decision.sla_seconds,
+            )
+            wo.handler_workflow_type = decision.target_workflow
+            wo.handler_domain = decision.target_domain
+            wo.status = WorkOrderStatus.DISPATCHED
+            wo.dispatched_at = time.time()
+            self.store.save_work_order(wo)
+
+            mode_label = "wait"
+            self._log(f"  → DELEGATION [{mode_label}]: {decision.policy_name}")
+            self._log(f"    work_order: {wo.work_order_id}")
+            self._log(f"    target: {decision.target_workflow}/{decision.target_domain}")
+            self._log(f"    contract: {decision.contract_name} v{decision.contract_version}")
+            tool_keys = [k for k, v in decision.inputs.items()
+                         if isinstance(v, (dict, list)) and k.startswith("get_")]
+            scalar_keys = [k for k in decision.inputs.keys() if k not in tool_keys]
+            self._log(f"    inputs: {scalar_keys}")
+            if tool_keys:
+                self._log(f"    tool data: [{', '.join(tool_keys)}]")
+            else:
+                self._log(f"    ⚠ NO tool data in inputs — handler retrieve may fail")
+                self._log(f"      hint: add get_* entries to delegation inputs in config.yaml")
+
+            self.store.log_action(
+                instance_id=source.instance_id,
+                correlation_id=source.correlation_id,
+                action_type="delegation_dispatched",
+                details={
+                    "work_order_id": wo.work_order_id,
+                    "policy": decision.policy_name,
+                    "mode": "wait_for_result",
+                    "target_workflow": decision.target_workflow,
+                    "target_domain": decision.target_domain,
+                    "contract": decision.contract_name,
+                },
+                idempotency_key=f"deleg:{source.instance_id}:{decision.policy_name}",
+            )
+            valid_pairs.append((decision, wo))
+
+        if not valid_pairs:
+            return
+
+        wo_ids = [wo.work_order_id for _, wo in valid_pairs]
+
+        # Determine resume step (all decisions should share resume_at_step)
+        resume_step = valid_pairs[0][0].resume_at_step
+        if not resume_step:
+            steps = source_state.get("steps", [])
+            if steps:
+                resume_step = steps[-1]["step_name"]
+
+        # ── Single suspension for all work orders ──────────────────────
+        suspension = Suspension.create(
+            instance_id=source.instance_id,
+            suspended_at_step=resume_step,
+            state_snapshot=self._compact_state_for_suspension(source_state),
+            work_order_ids=wo_ids,
+        )
+        self.store.save_suspension(suspension)
+
+        source.status = InstanceStatus.SUSPENDED
+        source.updated_at = time.time()
+        source.resume_nonce = suspension.resume_nonce
+        source.pending_work_orders = wo_ids
+        self.store.save_instance(source)
+
+        self._log(f"    source SUSPENDED at '{resume_step}', "
+                   f"waiting for {len(wo_ids)} work order(s)")
+
+        self.store.log_action(
+            instance_id=source.instance_id,
+            correlation_id=source.correlation_id,
+            action_type="suspended_for_delegation",
+            details={
+                "work_order_ids": wo_ids,
+                "resume_step": resume_step,
+                "resume_nonce": suspension.resume_nonce,
+            },
+        )
+
+        # ── Dispatch all handlers ───────────────────────────────────────
+        lineage = source.lineage + [f"{source.workflow_type}:{source.instance_id}"]
+        any_suspended = False
+
+        for decision, wo in valid_pairs:
+            try:
+                handler_id = self.start(
+                    workflow_type=decision.target_workflow,
+                    domain=decision.target_domain,
+                    case_input=decision.inputs,
+                    lineage=lineage,
+                    correlation_id=source.correlation_id,
+                    governance_tier_override=decision.governance_tier,
+                )
+                wo.handler_instance_id = handler_id
+                handler = self.store.get_instance(handler_id)
+
+                if handler and handler.status == InstanceStatus.COMPLETED:
+                    wo.status = WorkOrderStatus.COMPLETED
+                    wo.completed_at = time.time()
+                    wo.result = WorkOrderResult(
+                        work_order_id=wo.work_order_id,
+                        status="completed",
+                        outputs=handler.result or {},
+                        completed_at=time.time(),
+                    )
+                elif handler and handler.status == InstanceStatus.SUSPENDED:
+                    wo.status = WorkOrderStatus.RUNNING
+                    any_suspended = True
+                else:
+                    wo.status = WorkOrderStatus.FAILED
+                    wo.result = WorkOrderResult(
+                        work_order_id=wo.work_order_id,
+                        status="failed",
+                        error=f"Handler in unexpected state: "
+                              f"{handler.status.value if handler else 'none'}",
+                        completed_at=time.time(),
+                    )
+                self.store.save_work_order(wo)
+                self._log(f"    handler: {handler_id} → "
+                           f"{handler.status.value if handler else 'unknown'}")
+
+            except Exception as e:
+                wo.status = WorkOrderStatus.FAILED
+                wo.result = WorkOrderResult(
+                    work_order_id=wo.work_order_id,
+                    status="failed",
+                    error=str(e),
+                    completed_at=time.time(),
+                )
+                self.store.save_work_order(wo)
+                self.store.log_action(
+                    instance_id=source.instance_id,
+                    correlation_id=source.correlation_id,
+                    action_type="delegation_handler_failed",
+                    details={
+                        "policy": decision.policy_name,
+                        "target": f"{decision.target_workflow}/{decision.target_domain}",
+                        "mode": "wait_for_result",
+                        "error": str(e)[:500],
+                        "work_order_id": wo.work_order_id,
+                    },
+                )
+                self._log(f"    handler FAILED: {e}")
+
+        # If any handler is suspended (governance gate), source stays suspended.
+        # _check_delegation_completion will resume source when all handlers resolve.
+        if any_suspended:
+            return
+
+        # All handlers completed synchronously — resume source once with all results.
+        combined_input = {}
+        for _, wo in valid_pairs:
+            result_key = wo.handler_workflow_type or wo.work_order_id
+            if wo.status == WorkOrderStatus.COMPLETED and wo.result:
+                combined_input[result_key] = wo.result.outputs
+            elif wo.status == WorkOrderStatus.FAILED and wo.result:
+                combined_input[result_key] = {
+                    "_error": wo.result.error,
+                    "_status": wo.result.status,
+                }
+
+        self._log(f"  ↩ all {len(valid_pairs)} handler(s) done → resuming {source.instance_id}")
+        self.resume(
+            instance_id=source.instance_id,
+            external_input=combined_input,
+            resume_nonce=suspension.resume_nonce,
+        )
 
     def _execute_delegation(
         self,
