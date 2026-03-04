@@ -190,6 +190,9 @@ class Coordinator:
 
         self.verbose = verbose
 
+        # Cached MCP provider (avoids spawning a new subprocess per workflow)
+        self._mcp_provider: Any = None
+
         # Resource backpressure queue: work orders waiting for capacity
         # Key: resource_id or capability_key → list of (wo_id, instance_id, req, capability)
         self._resource_wait_queue: dict[str, list[dict[str, Any]]] = {}
@@ -279,6 +282,21 @@ class Coordinator:
 
         self._log(f"▶ START {instance.instance_id} "
                    f"({workflow_type}/{domain}) [tier={tier}]")
+
+        # When MCP is configured, strip pre-labeled fields so the LLM
+        # cannot see the answer (fraud_type, description, etc.) before
+        # it reasons. Child workflows triggered by delegation policies
+        # already receive lean inputs (just identifiers).
+        _mcp_active = (
+            os.environ.get("DATA_MCP_URL", "")
+            or os.environ.get("DATA_MCP_CMD", "")
+            or self.config.get("data_mcp_cmd", "")
+        )
+        if _mcp_active and not lineage:
+            # Only sanitize the root workflow input; delegation children
+            # already receive lean inputs constructed by the policy engine.
+            case_input = self._lean_case_input(case_input)
+            self._log(f"  🔒 Lean case_input applied (MCP active) — keys: {list(case_input.keys())}")
 
         # Execute the workflow (may complete or interrupt)
         try:
@@ -3312,10 +3330,27 @@ class Coordinator:
                 # Auto-confirm since the work order already completed
                 self._saga_coordinator.confirm(entry_id)
 
+    def _lean_case_input(self, case_input: dict[str, Any]) -> dict[str, Any]:
+        """
+        Strip pre-analysis labels and embedded tool data from case_input.
+
+        Used when MCP is active: the workflow receives only identifiers
+        (case_id, alert_id) and fetches all data via tool calls.
+        Prevents pre-labeled fields (fraud_type, description, etc.) from
+        leaking into LLM context before the model has a chance to reason.
+        """
+        _LEAN_EXCLUDE = {
+            "_meta", "description", "fraud_type", "alert_type", "risk_score",
+        }
+        return {
+            k: v for k, v in case_input.items()
+            if k not in _LEAN_EXCLUDE and not k.startswith("get_")
+        }
+
     def _build_tool_registry(self, case_input: dict[str, Any]):
         """
         Build tool registry with correct priority:
-          1. MCP server (production)
+          1. MCP server (env var DATA_MCP_URL / DATA_MCP_CMD, or config data_mcp_cmd)
           2. Case JSON tools (specific to this run — always take priority)
           3. Fixtures DB (fills in gaps for tools not in case JSON)
 
@@ -3324,24 +3359,33 @@ class Coordinator:
         should call the tools the workflow specifies, not everything available.
         """
         data_mcp_url = os.environ.get("DATA_MCP_URL", "")
-        data_mcp_cmd = os.environ.get("DATA_MCP_CMD", "")
+        # env var takes precedence; fall back to coordinator config
+        data_mcp_cmd = (
+            os.environ.get("DATA_MCP_CMD", "")
+            or self.config.get("data_mcp_cmd", "")
+        )
 
         if data_mcp_url or data_mcp_cmd:
             import asyncio
             from engine.providers import MCPProvider
             from engine.tools import ToolRegistry
+
+            # Reuse cached provider — avoids spawning a subprocess per workflow
+            if self._mcp_provider is None:
+                if data_mcp_url:
+                    self._mcp_provider = MCPProvider(transport="http", url=data_mcp_url)
+                else:
+                    parts = data_mcp_cmd.split()
+                    self._mcp_provider = MCPProvider(
+                        transport="stdio", command=parts[0], args=parts[1:],
+                    )
+                async def _connect():
+                    await self._mcp_provider.connect()
+                asyncio.get_event_loop().run_until_complete(_connect())
+                self._log(f"  📡 MCP provider connected ({len(self._mcp_provider.tools)} tools)")
+
             registry = ToolRegistry()
-            if data_mcp_url:
-                provider = MCPProvider(transport="http", url=data_mcp_url)
-            else:
-                parts = data_mcp_cmd.split()
-                provider = MCPProvider(
-                    transport="stdio", command=parts[0], args=parts[1:],
-                )
-            async def _connect():
-                await provider.connect()
-                provider.register_all(registry)
-            asyncio.get_event_loop().run_until_complete(_connect())
+            self._mcp_provider.register_all(registry)
             return registry
 
         # Check if case_input has tool-shaped data (dict values with tool-like keys)
