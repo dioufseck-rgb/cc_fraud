@@ -315,7 +315,13 @@ class MCPProvider:
           - self._discovered_resources has all resources
           - self._session is ready for call_tool / read_resource
         """
+        import asyncio
         import contextlib
+        # Store the event loop that creates this session so tool calls can
+        # reuse it.  MCP asyncio transports are bound to the loop that
+        # created them — using a different loop (e.g. via asyncio.run())
+        # causes a cross-loop deadlock.
+        self._loop = asyncio.get_event_loop()
         self._exit_stack = contextlib.AsyncExitStack()
         await self._exit_stack.__aenter__()
 
@@ -479,15 +485,26 @@ class MCPProvider:
                 except (json.JSONDecodeError, TypeError):
                     return {"content": combined, "raw_blocks": len(result.content)}
 
-            # Run async in the current or new event loop
+            # Run async using the event loop that owns the MCP session.
+            # The session's asyncio transport is bound to self._loop
+            # (set at connect() time).  Using a different loop (e.g. via
+            # asyncio.run()) causes a cross-loop deadlock.
+            import concurrent.futures
             try:
-                loop = asyncio.get_running_loop()
-                # Already in async context — use create_task
-                import concurrent.futures
-                future = asyncio.run_coroutine_threadsafe(_call(), loop)
+                running = asyncio.get_running_loop()
+                # Schedule on the owning loop regardless of which loop is
+                # currently running in this thread.
+                future = asyncio.run_coroutine_threadsafe(_call(), self._loop)
                 return future.result(timeout=60)
             except RuntimeError:
-                # No running loop — create one
+                # No running loop in this thread.
+                if self._loop and not self._loop.is_closed():
+                    if self._loop.is_running():
+                        # Persistent background loop — schedule safely.
+                        future = asyncio.run_coroutine_threadsafe(_call(), self._loop)
+                        return future.result(timeout=60)
+                    # Loop exists but is idle — drive it directly.
+                    return self._loop.run_until_complete(_call())
                 return asyncio.run(_call())
 
         return tool_fn
@@ -518,12 +535,17 @@ class MCPProvider:
                         "mime_type": resource_spec.get("mime_type", "text/plain"),
                     }
 
+            import concurrent.futures
             try:
-                loop = asyncio.get_running_loop()
-                import concurrent.futures
-                future = asyncio.run_coroutine_threadsafe(_read(), loop)
+                asyncio.get_running_loop()
+                future = asyncio.run_coroutine_threadsafe(_read(), self._loop)
                 return future.result(timeout=30)
             except RuntimeError:
+                if self._loop and not self._loop.is_closed():
+                    if self._loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(_read(), self._loop)
+                        return future.result(timeout=30)
+                    return self._loop.run_until_complete(_read())
                 return asyncio.run(_read())
 
         return resource_fn

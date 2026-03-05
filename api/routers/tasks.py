@@ -65,22 +65,11 @@ async def approve_task(task_id: str, req: ApproveRequest) -> dict[str, Any]:
     instance_id = task.callback.instance_id
 
     loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(executor, lambda: _run_approve(coord, instance_id, req.approver, req.notes))
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-    except Exception as exc:
-        raise HTTPException(500, f"Approval failed: {exc}")
+    # Fire-and-forget: submit to thread pool and return immediately.
+    # The approval may trigger a multi-minute LLM chain; the UI polls for updates.
+    loop.run_in_executor(executor, lambda: _run_approve(coord, instance_id, req.approver, req.notes))
 
-    instance = coord.store.get_instance(instance_id)
-    if not instance:
-        return {"instance_id": instance_id, "status": "approved"}
-
-    return {
-        "instance_id": instance_id,
-        "status": instance.status.value,
-        "correlation_id": instance.correlation_id,
-    }
+    return {"instance_id": instance_id, "status": "processing"}
 
 
 @router.post("/tasks/{task_id}/reject")
@@ -98,14 +87,10 @@ async def reject_task(task_id: str, req: RejectRequest) -> dict[str, Any]:
     instance_id = task.callback.instance_id
 
     loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(executor, lambda: _run_reject(coord, instance_id, req.rejector, req.reason))
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-    except Exception as exc:
-        raise HTTPException(500, f"Rejection failed: {exc}")
+    # Fire-and-forget: return immediately, UI polls for state change.
+    loop.run_in_executor(executor, lambda: _run_reject(coord, instance_id, req.rejector, req.reason))
 
-    return {"instance_id": instance_id, "status": "terminated"}
+    return {"instance_id": instance_id, "status": "processing"}
 
 
 # ── Thread-worker helpers ─────────────────────────────────────────────

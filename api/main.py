@@ -38,6 +38,23 @@ async def lifespan(app: FastAPI):
     deps.set_coordinator(coordinator)
     print(f"[startup] Coordinator ready (config: {COORD_CONFIG})", flush=True)
 
+    # ── Terminate stale "running" instances from the previous process ─
+    # Any instance left in "running" state by a previous server process
+    # will never complete; terminate them so the kanban stays clean.
+    try:
+        stale = [i for i in coordinator.store.list_instances(limit=1000)
+                 if i.status.value == "running"]
+        if stale:
+            for inst in stale:
+                try:
+                    coordinator.terminate(instance_id=inst.instance_id,
+                                          reason="Stale: server restarted")
+                except Exception:
+                    pass
+            print(f"[startup] Terminated {len(stale)} stale running instance(s)", flush=True)
+    except Exception as e:
+        print(f"[startup] WARNING: Could not clean stale instances: {e}", flush=True)
+
     # ── Thread pool for sync workflow execution ────────────────────
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="workflow")
     deps.set_executor(executor)

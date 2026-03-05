@@ -193,6 +193,13 @@ class Coordinator:
         # Cached MCP provider (avoids spawning a new subprocess per workflow)
         self._mcp_provider: Any = None
 
+        # Persistent background event loop for MCP operations.
+        # Thread pool workers create/close their own loops; we keep one
+        # long-lived loop so the MCP session's asyncio transports are never
+        # bound to a closed loop.
+        self._mcp_bg_loop = None
+        self._mcp_bg_thread = None
+
         # Resource backpressure queue: work orders waiting for capacity
         # Key: resource_id or capability_key → list of (wo_id, instance_id, req, capability)
         self._resource_wait_queue: dict[str, list[dict[str, Any]]] = {}
@@ -264,6 +271,27 @@ class Coordinator:
         )
         instance.status = InstanceStatus.RUNNING
         instance.updated_at = time.time()
+        # Extract key case facts for UI display (stable, doesn't change)
+        if not lineage:
+            ta = case_input.get("get_triggering_activity", {})
+            amount = (
+                ta.get("total_approved")
+                or ta.get("total_amount")
+                or sum(p.get("amount", 0) for p in ta.get("payments", []))
+            )
+            instance.case_meta = {
+                "case_id": case_input.get("case_id", ""),
+                "fraud_type": case_input.get("fraud_type", ""),
+                "risk_score": case_input.get("risk_score"),
+                "priority": case_input.get("get_alert", {}).get("priority", ""),
+                "sla_deadline": case_input.get("get_alert", {}).get("sla_deadline", ""),
+                "member_name": case_input.get("get_member", {}).get("full_name", ""),
+                "member_id": case_input.get("get_member", {}).get("member_id", ""),
+                "account_masked": case_input.get("get_account", {}).get("account_number_masked", ""),
+                "average_balance": case_input.get("get_account", {}).get("average_balance_6mo"),
+                "amount_at_risk": amount,
+                "description": case_input.get("description", ""),
+            }
         self.store.save_instance(instance)
 
         # Log to action ledger
@@ -383,8 +411,16 @@ class Coordinator:
             )
 
             if isinstance(result, dict):
-                # Workflow completed — normal path
-                self._on_completed(instance, result, is_resume=True)
+                # Workflow completed — normal path.
+                # is_resume=True only when we resumed from a governance gate
+                # (governance was already evaluated before that suspension).
+                # For delegation-resumes (suspended_at_step != __governance_gate__),
+                # governance has NOT yet evaluated — let it run now so the gate
+                # fires after generate_final_report has the full enriched package.
+                is_governance_resume = (
+                    suspension.suspended_at_step == "__governance_gate__"
+                )
+                self._on_completed(instance, result, is_resume=is_governance_resume)
             else:
                 # Workflow was interrupted again (recursive demand)
                 self._on_interrupted(instance, result, model, temperature)
@@ -829,9 +865,56 @@ class Coordinator:
             self._log(f"  ℹ quality gate skipped — tier locked by delegation override "
                        f"({instance.governance_tier})")
 
-        # ── Step 1: Evaluate governance tier ──
-        # Skip on resume: governance was already evaluated before suspension.
+        # ── Step 1a: Peek at wait_for_result delegations ──
+        # Blocking delegations MUST fire before the governance gate so that
+        # generate_final_report runs with the full enriched package.
+        # If any new wait_for_result delegation would fire, skip governance
+        # now — it fires on the delegation-resume completion instead.
+        has_blocking_delegations = False
         if not is_resume:
+            try:
+                pending_deleg = self.policy.evaluate_delegations(
+                    domain=instance.domain,
+                    workflow_output=final_state,
+                    lineage=instance.lineage,
+                )
+                # Dedup: skip already-fired policies
+                already_fired_set: set[str] = set()
+                try:
+                    ledger_entries = self.store.get_ledger(instance_id=instance.instance_id)
+                    for entry in ledger_entries:
+                        if entry.get("action_type") == "delegation_dispatched":
+                            details = entry.get("details", {})
+                            if isinstance(details, str):
+                                try:
+                                    details = json.loads(details)
+                                except (ValueError, TypeError):
+                                    details = {}
+                            pname = details.get("policy", "")
+                            if pname:
+                                already_fired_set.add(pname)
+                except Exception:
+                    pass
+                new_blocking = [
+                    d for d in pending_deleg
+                    if d.mode == "wait_for_result"
+                    and d.policy_name not in already_fired_set
+                ]
+                has_blocking_delegations = bool(new_blocking)
+                if has_blocking_delegations:
+                    self._log(
+                        f"  governance: deferred — {len(new_blocking)} wait_for_result "
+                        f"delegation(s) must run first (gate fires after final resume)"
+                    )
+            except Exception as e:
+                self._log(f"  governance: delegation pre-check failed ({e}); proceeding normally")
+
+        # ── Step 1b: Evaluate governance tier ──
+        # Skip when:
+        #   is_resume=True  — resumed from governance gate (already evaluated)
+        #   has_blocking_delegations — wait_for_result delegations fire first;
+        #                              gate deferred to delegation-resume completion
+        if not is_resume and not has_blocking_delegations:
             gov_decision = self.policy.evaluate_governance(
                 domain=instance.domain,
                 governance_tier=instance.governance_tier,
@@ -883,14 +966,15 @@ class Coordinator:
                     sla_seconds=self._get_tier_sla(gov_decision.tier),
                 )
                 self.tasks.publish(task)
-        else:
-            self._log(f"  governance: skipped (resume — already evaluated before suspension)")
+        elif is_resume:
+            self._log(f"  governance: skipped (resume from governance gate — already evaluated)")
             self.store.log_action(
                 instance_id=instance.instance_id,
                 correlation_id=instance.correlation_id,
                 action_type="governance_evaluation",
-                details={"skipped": True, "reason": "resume after delegation/approval"},
+                details={"skipped": True, "reason": "resume after governance approval"},
             )
+        # else: has_blocking_delegations — governance deferred, logged above
 
         # Mark completed (only reached if governance allows)
         instance.status = InstanceStatus.COMPLETED
@@ -2749,6 +2833,7 @@ class Coordinator:
         summary: dict[str, Any] = {
             "step_count": len(steps),
             "steps": [],
+            "input": final_state.get("input", {}),
         }
 
         for step in steps:
@@ -3347,6 +3432,28 @@ class Coordinator:
             if k not in _LEAN_EXCLUDE and not k.startswith("get_")
         }
 
+    def _get_mcp_loop(self):
+        """
+        Return a persistent background event loop for MCP operations.
+
+        Creates a daemon thread running loop.run_forever() on first call.
+        All MCP connect/disconnect/tool-call operations are scheduled on this
+        loop via run_coroutine_threadsafe(), so the MCP session's asyncio
+        transports are always bound to a live loop regardless of how many
+        thread-pool workers have come and gone.
+        """
+        import asyncio
+        import threading
+        if self._mcp_bg_loop is None or self._mcp_bg_loop.is_closed():
+            self._mcp_bg_loop = asyncio.new_event_loop()
+            self._mcp_bg_thread = threading.Thread(
+                target=self._mcp_bg_loop.run_forever,
+                daemon=True,
+                name="mcp-event-loop",
+            )
+            self._mcp_bg_thread.start()
+        return self._mcp_bg_loop
+
     def _build_tool_registry(self, case_input: dict[str, Any]):
         """
         Build tool registry with correct priority:
@@ -3381,7 +3488,9 @@ class Coordinator:
                     )
                 async def _connect():
                     await self._mcp_provider.connect()
-                asyncio.get_event_loop().run_until_complete(_connect())
+                mcp_loop = self._get_mcp_loop()
+                future = asyncio.run_coroutine_threadsafe(_connect(), mcp_loop)
+                future.result(timeout=30)
                 self._log(f"  📡 MCP provider connected ({len(self._mcp_provider.tools)} tools)")
 
             registry = ToolRegistry()

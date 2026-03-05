@@ -106,7 +106,8 @@ class CoordinatorStore:
                 pending_work_orders TEXT DEFAULT '[]',
                 resume_nonce TEXT DEFAULT '',
                 result TEXT,
-                error TEXT
+                error TEXT,
+                case_meta TEXT DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS work_orders (
@@ -163,6 +164,13 @@ class CoordinatorStore:
             self._commit()
         except Exception:
             pass  # Column already exists
+        try:
+            self.db.execute(
+                "ALTER TABLE instances ADD COLUMN case_meta TEXT DEFAULT '{}'"
+            )
+            self._commit()
+        except Exception:
+            pass  # Column already exists
 
     # ─── Instance CRUD ───────────────────────────────────────────────
 
@@ -173,8 +181,8 @@ class CoordinatorStore:
              governance_tier_locked,
              created_at, updated_at, lineage, correlation_id,
              current_step, step_count, elapsed_seconds,
-             pending_work_orders, resume_nonce, result, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             pending_work_orders, resume_nonce, result, error, case_meta)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             inst.instance_id, inst.workflow_type, inst.domain,
             inst.status.value, inst.governance_tier,
@@ -185,6 +193,7 @@ class CoordinatorStore:
             json.dumps(inst.pending_work_orders), inst.resume_nonce,
             json.dumps(inst.result) if inst.result else None,
             inst.error,
+            json.dumps(inst.case_meta) if inst.case_meta else "{}",
         ))
         self._commit()
 
@@ -232,6 +241,7 @@ class CoordinatorStore:
             resume_nonce=row["resume_nonce"],
             result=json.loads(row["result"]) if row["result"] else None,
             error=row["error"],
+            case_meta=json.loads(row["case_meta"]) if row["case_meta"] else {},
         )
 
     # ─── Work Order CRUD ─────────────────────────────────────────────

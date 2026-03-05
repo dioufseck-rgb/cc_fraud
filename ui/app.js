@@ -1,139 +1,217 @@
 /**
- * NFCU Fraud Operations Center — SPA
- *
- * Vanilla JS, no framework. Polls:
- *   - /api/backlog every 5s
- *   - /api/instances/{id}/chain every 2s while any instance is RUNNING
+ * Sentinel FCU — Fraud Operations Center
+ * Kanban board + detail panel + completed cases panel
  */
 
 // ── State ──────────────────────────────────────────────────────────
 let selectedInstanceId = null;   // root instance_id of selected case
-let backlogData = [];             // last fetched backlog
+let backlogData = [];             // last backlog response
 let chainPollingTimer = null;
 let backlogPollingTimer = null;
+let activeTab = 'detail';        // 'detail' | 'completed'
+let activeDetailTab = 'member';  // 'member' | 'workflow' | 'decisions' | 'meta'
+let pendingConfirmAction = null; // { type, taskId|instanceId, ... }
+let availableCases = [];
 
-// Pending confirm-modal action
-let pendingConfirmAction = null;  // { type: 'approve'|'reject', taskId, correlationId }
-
-// ── Init ───────────────────────────────────────────────────────────
+// ── Init ────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   await loadCasesForModal();
   await loadBacklog();
   backlogPollingTimer = setInterval(loadBacklog, 5000);
 });
 
-// ── Backlog ────────────────────────────────────────────────────────
+// ── Backlog ─────────────────────────────────────────────────────────
 async function loadBacklog() {
   try {
     const res = await fetch('/api/backlog');
     if (!res.ok) return;
     backlogData = await res.json();
-    renderBacklog(backlogData);
-    updateHeader(backlogData);
+    renderKanban(backlogData);
+    updateHeaderBadges(backlogData);
     document.getElementById('last-refresh').textContent =
-      'updated ' + new Date().toLocaleTimeString();
+      new Date().toLocaleTimeString();
   } catch (e) {
     console.warn('Backlog fetch failed:', e);
   }
 }
 
-function renderBacklog(instances) {
-  const el = document.getElementById('backlog-list');
-  const count = document.getElementById('backlog-count');
-  count.textContent = instances.length + ' case' + (instances.length !== 1 ? 's' : '');
+// ── Kanban ──────────────────────────────────────────────────────────
+const STAGES = ['triage', 'investigation', 'needs_review'];
 
-  if (instances.length === 0) {
-    el.innerHTML = `<div class="px-4 py-8 text-center text-slate-400 text-sm">No cases yet.<br/>Click + Submit Case to begin.</div>`;
-    return;
+function renderKanban(cases) {
+  const active = cases.filter(c => !['completed', 'failed'].includes(c.stage));
+  const completed = cases.filter(c => c.stage === 'completed');
+
+  // Update completed count badge
+  document.getElementById('completed-count-badge').textContent = completed.length;
+
+  // Group active by stage
+  const byStage = { triage: [], investigation: [], needs_review: [] };
+  for (const c of active) {
+    if (byStage[c.stage]) byStage[c.stage].push(c);
   }
 
-  el.innerHTML = instances.map(inst => {
-    const isActive = inst.instance_id === selectedInstanceId;
-    const statusInfo = getStatusInfo(inst.status);
-    const timeAgo = formatTimeAgo(inst.created_at);
-    const caseLabel = formatCaseId(inst.correlation_id);
-    const domainLabel = formatDomain(inst.domain);
-    const hasGate = inst.has_pending_gate;
+  for (const stage of STAGES) {
+    const col = document.getElementById(`col-${stage}`);
+    const count = document.getElementById(`count-${stage}`);
+    const items = byStage[stage] || [];
+    count.textContent = items.length;
+    if (items.length === 0) {
+      col.innerHTML = `<div class="text-center text-slate-400 text-xs py-4">No cases</div>`;
+    } else {
+      col.innerHTML = items.map(c => renderCaseCard(c)).join('');
+    }
+  }
 
-    return `
-    <div class="backlog-item border-l-3 border-transparent px-3 py-2.5 ${isActive ? 'active' : ''}"
-         onclick="selectCase('${inst.instance_id}')"
-         data-instance="${inst.instance_id}">
-      <div class="flex items-center justify-between gap-2">
-        <span class="font-mono text-xs font-semibold text-slate-700 truncate">${caseLabel}</span>
-        ${hasGate
-          ? `<span class="flex items-center gap-1 text-xs font-medium text-yellow-700 bg-yellow-50 border border-yellow-200 px-1.5 py-0.5 rounded">
-               <span class="pulse-dot w-1.5 h-1.5 rounded-full bg-yellow-500"></span>Gate
-             </span>`
-          : `<span class="flex items-center gap-1 text-xs font-medium ${statusInfo.textClass} ${statusInfo.bgClass} border ${statusInfo.borderClass} px-1.5 py-0.5 rounded">
-               ${statusInfo.icon} ${inst.status}
-             </span>`
-        }
+  // Re-render completed list if on that tab
+  if (activeTab === 'completed') renderCompletedList(completed);
+
+  // Highlight selected card
+  if (selectedInstanceId) {
+    document.querySelectorAll('.case-card').forEach(el => {
+      el.classList.toggle('selected', el.dataset.id === selectedInstanceId);
+    });
+  }
+}
+
+function renderCaseCard(inst) {
+  const meta = inst.case_meta || {};
+  const isGate = inst.stage === 'needs_review';
+  const isRunning = ['triage','investigation'].includes(inst.stage) && inst.status === 'running';
+  const isSelected = inst.instance_id === selectedInstanceId;
+
+  const fraudLabel = formatFraudType(meta.fraud_type || inst.domain);
+  const memberName = meta.member_name || '—';
+  const amount = meta.amount_at_risk != null ? '$' + fmtAmount(meta.amount_at_risk) : '';
+  const priority = meta.priority || '';
+  const sla = meta.sla_deadline ? fmtSla(meta.sla_deadline) : '';
+  const riskScore = meta.risk_score != null ? Math.round(meta.risk_score * 100) : null;
+  const caseId = meta.case_id || inst.correlation_id.slice(-10).toUpperCase();
+  const age = formatTimeAgo(inst.created_at);
+
+  const priorityColors = {
+    critical: 'bg-red-50 text-red-700 border-red-200',
+    high:     'bg-orange-50 text-orange-700 border-orange-200',
+    medium:   'bg-yellow-50 text-yellow-700 border-yellow-200',
+    low:      'bg-slate-50 text-slate-600 border-slate-200',
+  };
+  const priorityClass = priorityColors[priority] || 'bg-slate-50 text-slate-500 border-slate-200';
+
+  return `
+  <div class="case-card ${isGate ? 'gate-pending' : ''} ${isSelected ? 'selected' : ''}"
+       data-id="${inst.instance_id}" onclick="selectCase('${inst.instance_id}')">
+
+    <div class="flex items-start justify-between gap-2 mb-2">
+      <span class="font-mono text-xs font-bold text-slate-700">${escHtml(caseId)}</span>
+      <div class="flex items-center gap-1.5 shrink-0">
+        ${riskScore != null ? `<span class="text-xs font-medium ${riskScore >= 80 ? 'text-red-600' : riskScore >= 60 ? 'text-amber-600' : 'text-green-600'}">${riskScore}%</span>` : ''}
+        ${priority ? `<span class="text-xs border px-1.5 py-0.5 rounded ${priorityClass}">${priority}</span>` : ''}
       </div>
-      <div class="mt-0.5 flex items-center justify-between">
-        <span class="text-xs text-slate-500 truncate">${domainLabel}</span>
-        <span class="text-xs text-slate-400 shrink-0">${timeAgo}</span>
+    </div>
+
+    <div class="text-sm font-medium text-slate-800 truncate mb-0.5">${escHtml(memberName)}</div>
+    <div class="text-xs text-slate-500 truncate mb-2">${escHtml(fraudLabel)}</div>
+
+    <div class="flex items-center justify-between text-xs text-slate-400">
+      <span>${amount ? `<span class="font-medium text-slate-600">${amount}</span> at risk` : ''}</span>
+      <div class="flex items-center gap-2">
+        ${isGate ? `<span class="flex items-center gap-1 text-amber-600 font-medium"><span class="pulse-dot w-1.5 h-1.5 rounded-full bg-amber-500"></span>Gate</span>` : isRunning ? `<span class="flex items-center gap-1 text-sky-500 font-medium"><span class="spinner"></span>Running</span>` : `<span>${age}</span>`}
+        ${sla ? `<span title="SLA deadline">${sla}</span>` : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderCompletedList(completed) {
+  const el = document.getElementById('completed-list');
+  if (!completed || completed.length === 0) {
+    el.innerHTML = `<div class="p-6 text-center text-slate-400 text-sm">No completed cases yet.</div>`;
+    return;
+  }
+  el.innerHTML = completed.map(inst => {
+    const meta = inst.case_meta || {};
+    const caseId = meta.case_id || inst.correlation_id.slice(-10).toUpperCase();
+    const member = meta.member_name || '—';
+    const fraud = formatFraudType(meta.fraud_type || inst.domain);
+    const amount = meta.amount_at_risk != null ? '$' + fmtAmount(meta.amount_at_risk) : '';
+    const isSelected = inst.instance_id === selectedInstanceId;
+    return `
+    <div class="px-4 py-3 cursor-pointer hover:bg-slate-50 transition-colors ${isSelected ? 'bg-blue-50' : ''}"
+         onclick="selectCase('${inst.instance_id}'); switchTab('detail')">
+      <div class="flex items-center justify-between gap-2">
+        <span class="font-mono text-xs font-bold text-slate-700">${escHtml(caseId)}</span>
+        <span class="text-xs text-green-700 bg-green-50 border border-green-200 px-1.5 py-0.5 rounded">✓ done</span>
+      </div>
+      <div class="text-sm font-medium text-slate-700 truncate mt-0.5">${escHtml(member)}</div>
+      <div class="flex items-center justify-between mt-0.5">
+        <span class="text-xs text-slate-500">${escHtml(fraud)}</span>
+        <span class="text-xs text-slate-400">${amount}</span>
       </div>
     </div>`;
   }).join('');
 }
 
-function updateHeader(instances) {
-  const pending = instances.filter(i => i.has_pending_gate).length;
-  const running = instances.filter(i => i.status === 'running').length;
+// ── Header badges ────────────────────────────────────────────────────
+function updateHeaderBadges(cases) {
+  const gates = cases.filter(c => c.has_pending_gate).length;
+  const running = cases.filter(c => ['triage','investigation'].includes(c.stage)).length;
 
-  const gateBadge = document.getElementById('gate-count-badge');
-  const gateText = document.getElementById('gate-count-text');
-  const runBadge = document.getElementById('running-badge');
-  const runText = document.getElementById('running-count-text');
+  const gb = document.getElementById('gate-badge');
+  gb.classList.toggle('hidden', gates === 0);
+  gb.classList.toggle('flex', gates > 0);
+  document.getElementById('gate-badge-text').textContent = `${gates} pending gate${gates !== 1 ? 's' : ''}`;
 
-  if (pending > 0) {
-    gateBadge.classList.remove('hidden');
-    gateBadge.classList.add('flex');
-    gateText.textContent = pending + ' pending gate' + (pending !== 1 ? 's' : '');
-  } else {
-    gateBadge.classList.add('hidden');
-    gateBadge.classList.remove('flex');
-  }
-
-  if (running > 0) {
-    runBadge.classList.remove('hidden');
-    runBadge.classList.add('flex');
-    runText.textContent = running + ' running';
-  } else {
-    runBadge.classList.add('hidden');
-    runBadge.classList.remove('flex');
-  }
+  const rb = document.getElementById('running-badge');
+  rb.classList.toggle('hidden', running === 0);
+  rb.classList.toggle('flex', running > 0);
+  document.getElementById('running-badge-text').textContent = `${running} running`;
 }
 
-// ── Case Selection ─────────────────────────────────────────────────
+// ── Tab switching ────────────────────────────────────────────────────
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById('tab-detail').classList.toggle('hidden', tab !== 'detail');
+  document.getElementById('tab-completed').classList.toggle('hidden', tab !== 'completed');
+  document.getElementById('tab-detail-btn').classList.toggle('active', tab === 'detail');
+  document.getElementById('tab-completed-btn').classList.toggle('active', tab === 'completed');
+
+  if (tab === 'completed') {
+    const completed = backlogData.filter(c => c.stage === 'completed');
+    renderCompletedList(completed);
+  }
+  // also refresh completed count badge
+  document.getElementById('completed-count-badge').textContent =
+    backlogData.filter(c => c.stage === 'completed').length;
+}
+
+// ── Case selection ───────────────────────────────────────────────────
 async function selectCase(instanceId) {
   selectedInstanceId = instanceId;
+  activeDetailTab = 'member';  // reset inner tab on case change
+  switchTab('detail');
 
-  // Highlight active item in backlog
-  document.querySelectorAll('.backlog-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.instance === instanceId);
+  // Highlight card
+  document.querySelectorAll('.case-card').forEach(el => {
+    el.classList.toggle('selected', el.dataset.id === instanceId);
   });
 
-  // Stop existing chain polling
-  if (chainPollingTimer) clearInterval(chainPollingTimer);
+  // Stop old polling
+  if (chainPollingTimer) { clearInterval(chainPollingTimer); chainPollingTimer = null; }
 
   // Load chain immediately
   const chain = await loadChain(instanceId);
 
-  // Poll every 2s while any instance is running/created
-  const isLive = chain && chain.some(i => ['running', 'created'].includes(i.status));
-  if (isLive) {
-    chainPollingTimer = setInterval(async () => {
-      const c = await loadChain(instanceId);
-      if (!c || c.every(i => isTerminal(i.status))) {
-        clearInterval(chainPollingTimer);
-        chainPollingTimer = null;
-        // Refresh backlog too
-        await loadBacklog();
-      }
-    }, 2000);
-  }
+  // Always poll: the root may already be complete while child delegations are
+  // still running or suspended.  Stop only when every instance is terminal.
+  chainPollingTimer = setInterval(async () => {
+    if (selectedInstanceId !== instanceId) { clearInterval(chainPollingTimer); chainPollingTimer = null; return; }
+    const c = await loadChain(instanceId);
+    if (!c || c.every(i => isTerminal(i.status))) {
+      clearInterval(chainPollingTimer);
+      chainPollingTimer = null;
+      await loadBacklog();
+    }
+  }, 2000);
 }
 
 async function loadChain(instanceId) {
@@ -141,7 +219,7 @@ async function loadChain(instanceId) {
     const res = await fetch(`/api/instances/${instanceId}/chain`);
     if (!res.ok) return null;
     const chain = await res.json();
-    renderChain(chain);
+    if (selectedInstanceId === instanceId) renderDetail(chain);
     return chain;
   } catch (e) {
     console.warn('Chain fetch failed:', e);
@@ -149,516 +227,659 @@ async function loadChain(instanceId) {
   }
 }
 
-// ── Chain View ─────────────────────────────────────────────────────
-function renderChain(chain) {
-  const panel = document.getElementById('main-panel');
+// ── Detail Panel ─────────────────────────────────────────────────────
+function renderDetail(chain) {
+  const panel = document.getElementById('tab-detail');
   if (!chain || chain.length === 0) {
-    panel.innerHTML = `<div class="p-8 text-slate-400 text-sm">No instances found.</div>`;
+    panel.innerHTML = `<div class="p-8 text-slate-400 text-sm">No data found.</div>`;
     return;
   }
 
   const root = chain[0];
-  const correlationId = root.correlation_id;
-  const caseLabel = formatCaseId(correlationId);
-  const rootStatus = getStatusInfo(root.status);
+  const meta = root.case_meta || {};
+  // Prefer case_input from root (for completed), fallback to first chain member with it
+  const caseInput = root.case_input
+    || chain.find(i => i.case_input && Object.keys(i.case_input).length > 0)?.case_input
+    || {};
 
-  // Find any pending gate
   const suspended = chain.find(i => i.status === 'suspended' && i.pending_task);
+  const anySuspended = chain.find(i => i.status === 'suspended');
+  const isLive = chain.some(i => ['running','created'].includes(i.status));
+  const caseId = meta.case_id || root.correlation_id.slice(-10).toUpperCase();
 
-  let html = `
-  <div class="p-6 max-w-4xl mx-auto space-y-5">
+  panel.innerHTML = `
+  <div class="p-4 space-y-4">
 
     <!-- Case header -->
-    <div class="bg-white rounded-xl border border-slate-200 px-5 py-4">
-      <div class="flex items-start justify-between gap-4">
+    <div class="bg-white rounded-xl border border-slate-200 p-4">
+      <div class="flex items-start justify-between gap-3 mb-3">
         <div>
-          <div class="flex items-center gap-3 mb-1">
-            <span class="font-mono font-semibold text-navy text-lg">${caseLabel}</span>
-            <span class="flex items-center gap-1.5 text-sm font-medium ${rootStatus.textClass} ${rootStatus.bgClass} border ${rootStatus.borderClass} px-2.5 py-0.5 rounded-full">
-              ${rootStatus.icon} ${root.status.toUpperCase()}
-            </span>
+          <div class="flex items-center gap-2 mb-0.5">
+            <span class="font-mono font-bold text-navy text-base">${escHtml(caseId)}</span>
+            ${meta.priority ? `<span class="text-xs border px-1.5 py-0.5 rounded ${priorityClass(meta.priority)}">${meta.priority}</span>` : ''}
           </div>
-          <div class="text-sm text-slate-500">${formatDomain(root.domain)} · ${root.governance_tier} tier</div>
+          <div class="text-sm text-slate-500">${escHtml(formatFraudType(meta.fraud_type || root.domain))}</div>
         </div>
-        <div class="text-right text-xs text-slate-400">
+        <div class="text-right text-xs text-slate-400 shrink-0">
           <div>Started ${formatTimeAgo(root.created_at)}</div>
-          ${root.elapsed_seconds > 0 ? `<div>${root.elapsed_seconds.toFixed(1)}s total</div>` : ''}
+          ${isLive ? `<div class="text-sky-500 flex items-center gap-1 justify-end"><span class="pulse-dot w-1.5 h-1.5 rounded-full bg-sky-400"></span>Processing</div>` : ''}
         </div>
       </div>
 
-      <!-- Delegation flow diagram -->
-      <div class="mt-4 pt-4 border-t border-slate-100">
-        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Delegation Chain</div>
-        ${renderDelegationFlow(chain)}
+      <!-- Stage flow -->
+      <div class="flex flex-wrap items-center gap-1.5 text-xs">
+        ${chain.map(inst => {
+          const si = statusInfo(inst.status);
+          const isRunning = ['running','created'].includes(inst.status);
+          return `<span class="flex items-center gap-1 ${si.text} ${si.bg} border ${si.border} px-2 py-0.5 rounded-full">
+            ${isRunning ? `<span class="pulse-dot w-1.5 h-1.5 rounded-full bg-current"></span>` : si.icon}
+            ${escHtml(workflowLabel(inst.workflow_type, inst.domain))}
+          </span>`;
+        }).join('<span class="text-slate-300">→</span>')}
       </div>
     </div>
+
+    <!-- Triage summary -->
+    ${renderTriageSummary(chain)}
 
     <!-- Gate banner -->
     ${suspended ? renderGateBanner(suspended) : ''}
 
-    <!-- Instance sections (step cards) -->
-    ${chain.map(inst => renderInstanceSection(inst, chain)).join('')}
+    <!-- Content tabs -->
+    <div class="bg-white rounded-xl border border-slate-200 overflow-hidden">
+      <div class="flex border-b border-slate-100 px-2 bg-slate-50">
+        <button class="tab-btn active" id="dt-member-btn" onclick="switchDetailTab('member')">Member &amp; Case</button>
+        <button class="tab-btn" id="dt-workflow-btn" onclick="switchDetailTab('workflow')">Workflow</button>
+        <button class="tab-btn" id="dt-decisions-btn" onclick="switchDetailTab('decisions')">Decisions</button>
+        <button class="tab-btn" id="dt-meta-btn" onclick="switchDetailTab('meta')">Metadata</button>
+      </div>
+
+      <div id="dt-member" class="p-4">
+        ${renderMemberTab(caseInput, meta)}
+      </div>
+      <div id="dt-workflow" class="p-4 hidden">
+        ${chain.map(inst => renderInstanceWorkflow(inst)).join('')}
+      </div>
+      <div id="dt-decisions" class="p-4 hidden">
+        ${renderDecisionsTab(chain)}
+      </div>
+      <div id="dt-meta" class="p-4 hidden">
+        ${renderMetaTab(chain, root)}
+      </div>
+    </div>
+
+    <!-- Action buttons -->
+    ${renderActionButtons(chain, suspended)}
+
   </div>`;
 
-  panel.innerHTML = html;
-}
-
-function renderDelegationFlow(chain) {
-  // Group by lineage depth
-  const byDepth = {};
-  chain.forEach(inst => {
-    const depth = inst.lineage.length;
-    if (!byDepth[depth]) byDepth[depth] = [];
-    byDepth[depth].push(inst);
-  });
-
-  const depths = Object.keys(byDepth).map(Number).sort();
-  const rows = depths.map(depth => {
-    const instances = byDepth[depth];
-    return instances.map(inst => {
-      const info = getStatusInfo(inst.status);
-      const label = formatWorkflowLabel(inst.workflow_type, inst.domain);
-      const isRunning = inst.status === 'running' || inst.status === 'created';
-      return `<span class="chain-node ${info.textClass} ${info.bgClass} border-${info.borderColor}">
-        ${isRunning ? `<span class="pulse-dot w-1.5 h-1.5 rounded-full bg-current"></span>` : info.icon}
-        ${label}
-      </span>`;
-    }).join(`<span class="text-slate-300 mx-1">·</span>`);
-  });
-
-  // Join depth levels with arrows
-  const flowParts = [];
-  for (let i = 0; i < rows.length; i++) {
-    flowParts.push(`<span class="flex flex-wrap items-center gap-2">${rows[i]}</span>`);
-    if (i < rows.length - 1) {
-      const childDepth = depths[i + 1];
-      const parentDepth = depths[i];
-      const isWait = chain.some(inst =>
-        inst.lineage.length === childDepth &&
-        byDepth[parentDepth].some(p => inst.lineage.includes(p.instance_id))
-      );
-      flowParts.push(`
-        <span class="flex items-center gap-1 text-slate-400 text-xs my-1 ml-2">
-          <span class="text-slate-300">↓</span>
-          <span>${isWait ? 'wait_for_result' : 'fire_and_forget'}</span>
-        </span>`);
-    }
+  // Restore whichever inner tab was active before the re-render
+  if (activeDetailTab !== 'member') {
+    switchDetailTab(activeDetailTab);
   }
-  return `<div class="space-y-1">${flowParts.join('')}</div>`;
 }
 
+function switchDetailTab(tab) {
+  activeDetailTab = tab;
+  ['member','workflow','decisions','meta'].forEach(t => {
+    document.getElementById(`dt-${t}`)?.classList.toggle('hidden', t !== tab);
+    document.getElementById(`dt-${t}-btn`)?.classList.toggle('active', t === tab);
+  });
+}
+
+// ── Triage Summary ───────────────────────────────────────────────────
+function renderTriageSummary(chain) {
+  const triage = chain.find(i => i.workflow_type === 'fraud_triage');
+  if (!triage) return '';
+  const steps = triage.result?.steps || [];
+  const isRunning = ['running','created'].includes(triage.status);
+  if (isRunning && steps.length === 0) {
+    return `
+    <div class="bg-sky-50 border border-sky-200 rounded-xl p-3 flex items-center gap-2 text-sm text-sky-700">
+      <span class="pulse-dot w-2 h-2 rounded-full bg-sky-400 shrink-0"></span>
+      Triage running — classifying fraud type and assessing risk…
+    </div>`;
+  }
+  if (steps.length === 0) return '';
+
+  // Pull key classify steps
+  const classifyFraud = steps.find(s => s.step_name === 'classify_fraud_type' || (s.primitive === 'classify' && s.step_name?.includes('fraud')));
+  const classifyCustomer = steps.find(s => s.step_name?.includes('customer') || s.step_name?.includes('member'));
+  const priority = steps.find(s => s.step_name?.includes('priority') || s.step_name?.includes('assess'));
+
+  // Routing target = first specialist in chain
+  const specialist = chain.find(i => i !== triage);
+  const routedTo = specialist ? workflowLabel(specialist.workflow_type, specialist.domain) : null;
+
+  const rows = [];
+  if (classifyFraud?.category) rows.push(['Fraud Type', classifyFraud.category, classifyFraud.confidence]);
+  if (classifyCustomer?.category) rows.push(['Customer', classifyCustomer.category, classifyCustomer.confidence]);
+  if (priority?.category) rows.push(['Priority', priority.category, priority.confidence]);
+
+  if (rows.length === 0 && !routedTo) return '';
+
+  return `
+  <div class="bg-white border border-slate-200 rounded-xl p-4">
+    <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Triage Result</div>
+    <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-sm mb-3">
+      ${rows.map(([label, val, conf]) => `
+        <div class="text-slate-500 text-xs">${label}</div>
+        <div class="flex items-center gap-1.5">
+          <span class="font-medium text-slate-800">${escHtml(formatFraudType(val))}</span>
+          ${conf != null ? `<span class="text-xs text-slate-400">${Math.round(conf*100)}%</span>` : ''}
+        </div>`).join('')}
+    </div>
+    ${routedTo ? `
+    <div class="flex items-center gap-1.5 text-xs text-slate-500 pt-2 border-t border-slate-100">
+      <span>Routed to</span>
+      <span class="font-medium text-slate-700">→ ${escHtml(routedTo)}</span>
+      ${specialist?.status === 'suspended' ? '<span class="text-amber-600 font-medium">· awaiting approval</span>' : ''}
+      ${specialist?.status === 'running' ? '<span class="pulse-dot w-1.5 h-1.5 rounded-full bg-sky-400 inline-block"></span>' : ''}
+    </div>` : ''}
+  </div>`;
+}
+
+// ── Gate Banner ──────────────────────────────────────────────────────
 function renderGateBanner(inst) {
   const task = inst.pending_task;
   if (!task) return '';
   return `
-  <div class="gate-pulse bg-yellow-50 border-2 border-yellow-400 rounded-xl p-5">
-    <div class="flex items-center justify-between flex-wrap gap-4">
-      <div>
-        <div class="flex items-center gap-2 mb-1">
-          <span class="text-yellow-600 text-lg">⚠</span>
-          <span class="font-semibold text-yellow-800">Awaiting Analyst Approval</span>
-        </div>
-        <div class="text-sm text-yellow-700">
-          <span class="font-medium">${formatWorkflowLabel(inst.workflow_type, inst.domain)}</span>
-          · Gate tier · Queue: <code class="bg-yellow-100 px-1 rounded text-xs">${task.queue || 'fraud_analyst_review'}</code>
-        </div>
-        ${task.expires_at ? `<div class="text-xs text-yellow-600 mt-1">Expires ${formatTimeAgo(task.expires_at)}</div>` : ''}
+  <div class="gate-banner bg-amber-50 border-2 border-amber-400 rounded-xl p-4">
+    <div class="flex items-center gap-2 mb-1">
+      <span class="text-amber-500 text-base">⚠</span>
+      <span class="font-semibold text-amber-800 text-sm">Awaiting Analyst Approval</span>
+    </div>
+    <div class="text-xs text-amber-700">
+      ${escHtml(workflowLabel(inst.workflow_type, inst.domain))} ·
+      Queue: <code class="bg-amber-100 px-1 rounded">${escHtml(task.queue || 'fraud_analyst_review')}</code>
+    </div>
+  </div>`;
+}
+
+// ── Member & Case Tab ────────────────────────────────────────────────
+function renderMemberTab(input, meta) {
+  const member = input.get_member || {};
+  const account = input.get_account || {};
+  const alert = input.get_alert || {};
+  const card = input.get_card || {};
+  const activity = input.get_triggering_activity || {};
+  const regE = input.get_reg_e_info || {};
+  const priorAlerts = input.get_prior_alerts || {};
+
+  if (!member.full_name && !meta.member_name) {
+    return `<p class="text-sm text-slate-400 italic">Case data will appear after the first retrieve step completes.</p>`;
+  }
+
+  const name = member.full_name || meta.member_name || '—';
+  const sections = [];
+
+  // Member section
+  sections.push(`
+  <div class="mb-4">
+    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Member</div>
+    <table class="data-table">
+      ${row('Name', name)}
+      ${row('Member ID', member.member_id)}
+      ${row('DOB', member.date_of_birth)}
+      ${row('SSN', member.ssn_masked)}
+      ${row('Address', member.address)}
+      ${row('Phone', member.phone)}
+      ${row('Email', member.email)}
+      ${row('Member Since', member.member_since)}
+      ${row('Type', member.member_type)}
+      ${row('Employer', member.employer)}
+      ${row('Title', member.title)}
+      ${row('Annual Pay', member.annual_pay ? '$' + fmtAmount(member.annual_pay) : null)}
+      ${row('Clearance', member.clearance)}
+      ${row('Risk Rating', member.risk_rating)}
+      ${row('Branch', member.branch_affiliation)}
+      ${row('Rank', member.rank_retired)}
+      ${row('Pension/mo', member.pension_monthly ? '$' + fmtAmount(member.pension_monthly) : null)}
+      ${row('VA Disability/mo', member.va_disability_monthly ? '$' + fmtAmount(member.va_disability_monthly) : null)}
+    </table>
+  </div>`);
+
+  // Account section
+  if (account.account_number_masked) {
+    sections.push(`
+    <div class="mb-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Account</div>
+      <table class="data-table">
+        ${row('Account', account.account_number_masked)}
+        ${row('Type', account.account_type)}
+        ${row('Product', account.product)}
+        ${row('Opened', account.opened)}
+        ${row('Status', account.status)}
+        ${row('Avg Balance (6mo)', account.average_balance_6mo ? '$' + fmtAmount(account.average_balance_6mo) : null)}
+        ${row('Avg Deposits (6mo)', account.avg_deposits_6mo ? '$' + fmtAmount(account.avg_deposits_6mo) : null)}
+        ${row('Avg Withdrawals (6mo)', account.avg_withdrawals_6mo ? '$' + fmtAmount(account.avg_withdrawals_6mo) : null)}
+        ${row('Primary Deposit', account.primary_deposit_source)}
+        ${row('Geo Pattern', account.geographic_pattern)}
+        ${row('Zelle History', account.zelle_history)}
+        ${row('Wire History', account.wire_history)}
+      </table>
+    </div>`);
+  }
+
+  // Alert section
+  if (alert.alert_id) {
+    sections.push(`
+    <div class="mb-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Alert</div>
+      <table class="data-table">
+        ${row('Alert ID', alert.alert_id)}
+        ${row('Type', alert.alert_type)}
+        ${row('Source', alert.alert_source)}
+        ${row('Rule', alert.monitoring_rule)}
+        ${row('Risk Score', alert.risk_score)}
+        ${row('Priority', alert.priority)}
+        ${row('SLA Deadline', alert.sla_deadline)}
+      </table>
+    </div>`);
+  }
+
+  // Card section
+  if (card.card_number_masked) {
+    sections.push(`
+    <div class="mb-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Card</div>
+      <table class="data-table">
+        ${row('Card', card.card_number_masked)}
+        ${row('Type', card.card_type)}
+        ${row('Product', card.product)}
+        ${row('Issued', card.issued)}
+        ${row('Expiry', card.expiry)}
+        ${row('Status', card.card_status)}
+        ${card.last_legitimate_use ? row('Last Legit Use', `${card.last_legitimate_use.date} ${card.last_legitimate_use.time} — ${card.last_legitimate_use.merchant} (${card.last_legitimate_use.method})`) : ''}
+      </table>
+    </div>`);
+  }
+
+  // Triggering activity
+  if (activity.suspicious_transactions || activity.payments || activity.scam_type) {
+    const txns = activity.suspicious_transactions || activity.payments || [];
+    sections.push(`
+    <div class="mb-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+        Triggering Activity
+        ${activity.total_approved != null ? `<span class="ml-2 text-red-600 normal-case font-semibold">$${fmtAmount(activity.total_approved)} at risk</span>` : ''}
+        ${activity.total_amount != null ? `<span class="ml-2 text-red-600 normal-case font-semibold">$${fmtAmount(activity.total_amount)} at risk</span>` : ''}
       </div>
-      <div class="flex gap-3">
-        <button onclick="openApproveModal('${task.task_id}', '${inst.correlation_id}')"
-          class="px-5 py-2 bg-green-600 text-white font-medium text-sm rounded-lg hover:bg-green-700 transition-colors flex items-center gap-2">
+      ${activity.scam_type ? `
+        <table class="data-table mb-3">
+          ${row('Scam Type', activity.scam_type)}
+          ${row('Platform', activity.contact_platform)}
+          ${row('First Contact', activity.first_contact_date)}
+          ${activity.scammer_persona ? row('Scammer Persona', activity.scammer_persona.name_used + ' — ' + activity.scammer_persona.claimed_identity) : ''}
+        </table>
+        ${activity.escalation_timeline ? `
+          <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Timeline</div>
+          <div class="space-y-1 mb-3">
+            ${activity.escalation_timeline.map(e => `
+              <div class="flex gap-2 text-xs">
+                <span class="text-slate-400 shrink-0 w-24">${e.date}</span>
+                <span class="text-slate-600">${escHtml(e.event)}</span>
+              </div>`).join('')}
+          </div>` : ''}
+      ` : ''}
+      ${txns.length > 0 ? `
+        <div class="overflow-x-auto">
+          <table class="data-table text-xs">
+            <thead><tr>
+              <th>Date/Time</th><th>Merchant</th>
+              <th class="text-right">Amount</th>
+              <th>Method</th><th>Location</th><th>Status</th>
+            </tr></thead>
+            <tbody>
+              ${txns.map(t => `<tr>
+                <td>${t.date || ''} ${t.time || ''}</td>
+                <td>${escHtml(t.merchant || t.description || '')}</td>
+                <td class="text-right font-medium ${(t.amount||0) < 0 ? 'text-red-600' : 'text-slate-700'}">$${fmtAmount(Math.abs(t.amount || 0))}</td>
+                <td>${escHtml(t.method || t.type || '')}</td>
+                <td>${escHtml(t.ip_geolocation || t.channel || '')}</td>
+                <td class="${t.status === 'approved' || t.status === 'posted' ? 'text-red-600' : 'text-slate-500'}">${escHtml(t.status || '')}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : ''}
+    </div>`);
+  }
+
+  // Reg E
+  if (regE.total_unauthorized_amount != null) {
+    sections.push(`
+    <div class="mb-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Reg E / Compliance</div>
+      <table class="data-table">
+        ${row('Total Unauthorized', '$' + fmtAmount(regE.total_unauthorized_amount))}
+        ${row('Net Loss Exposure', '$' + fmtAmount(regE.net_loss_exposure))}
+        ${row('Member Liability', regE.member_liability)}
+        ${row('Notification Deadline', regE.notification_deadline)}
+        ${row('Provisional Credit Deadline', regE.provisional_credit_deadline)}
+      </table>
+    </div>`);
+  }
+
+  // Prior alerts
+  const priorList = priorAlerts.prior_alerts || [];
+  const priorClaims = priorAlerts.prior_fraud_claims || [];
+  if (priorList.length > 0 || priorClaims.length > 0) {
+    sections.push(`
+    <div class="mb-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Prior Alerts & Claims</div>
+      ${priorList.length > 0 ? `<div class="text-xs text-slate-500 mb-1">${priorList.length} prior alert(s)</div>` : '<div class="text-xs text-slate-400 italic">No prior alerts</div>'}
+      ${priorClaims.length > 0 ? `<div class="text-xs text-slate-500">${priorClaims.length} prior claim(s)</div>` : '<div class="text-xs text-slate-400 italic">No prior claims</div>'}
+    </div>`);
+  }
+
+  return sections.join('') || `<p class="text-sm text-slate-400 italic">No case data available.</p>`;
+}
+
+// ── Workflow Tab ─────────────────────────────────────────────────────
+function renderInstanceWorkflow(inst) {
+  const steps = inst.result?.steps || [];
+  const isRunning = ['running','created'].includes(inst.status);
+  const depth = inst.lineage.length;
+  const indent = depth > 0 ? 'ml-4' : '';
+
+  return `
+  <div class="mb-4 ${indent}">
+    <div class="flex items-center gap-2 mb-2">
+      ${depth > 0 ? '<span class="text-slate-300">└</span>' : ''}
+      <span class="font-medium text-slate-700 text-sm">${escHtml(workflowLabel(inst.workflow_type, inst.domain))}</span>
+      <span class="text-xs ${statusInfo(inst.status).text} ${statusInfo(inst.status).bg} border ${statusInfo(inst.status).border} px-2 py-0.5 rounded-full">
+        ${isRunning ? `<span class="pulse-dot inline-block w-1.5 h-1.5 rounded-full bg-current mr-1"></span>` : statusInfo(inst.status).icon + ' '}${inst.status}
+      </span>
+      ${inst.elapsed_seconds > 0 ? `<span class="text-xs text-slate-400">${inst.elapsed_seconds.toFixed(1)}s</span>` : ''}
+    </div>
+
+    ${inst.error ? `<div class="text-xs text-red-600 bg-red-50 border border-red-100 rounded p-2 mb-2">${escHtml(inst.error)}</div>` : ''}
+
+    ${isRunning && steps.length === 0 ? `
+    <div class="flex items-center gap-2 text-slate-400 text-xs py-2 px-3 bg-slate-50 rounded">
+      <span class="pulse-dot w-2 h-2 rounded-full bg-sky-400"></span>
+      Executing...
+    </div>` : ''}
+
+    ${steps.map((step, i) => renderStepCard(step, inst.instance_id, i)).join('')}
+  </div>`;
+}
+
+function renderStepCard(step, instId, idx) {
+  const prim = step.primitive || 'unknown';
+  const cardId = `sc-${instId}-${idx}`;
+  const pi = primInfo(prim);
+
+  return `
+  <div class="step-card">
+    <div class="step-header" onclick="toggleStep('${cardId}')">
+      <span class="text-xs font-semibold px-2 py-0.5 rounded ${pi.text} ${pi.bg}">${prim}</span>
+      <span class="text-sm text-slate-700 flex-1">${escHtml(step.step_name || 'step')}</span>
+      ${confPill(step.confidence)}
+      <span class="text-slate-300 text-xs" id="${cardId}-icon">▼</span>
+    </div>
+    <div id="${cardId}" class="hidden px-4 py-3 bg-white border-t border-slate-100">
+      ${renderStepBody(step)}
+    </div>
+  </div>`;
+}
+
+function toggleStep(id) {
+  const el = document.getElementById(id);
+  const icon = document.getElementById(id + '-icon');
+  if (!el) return;
+  const open = !el.classList.contains('hidden');
+  el.classList.toggle('hidden', open);
+  if (icon) icon.textContent = open ? '▼' : '▲';
+}
+
+function renderStepBody(step) {
+  const prim = step.primitive;
+  if (prim === 'classify') return `
+    <div class="flex items-center gap-2 mb-2">
+      <span class="font-semibold text-slate-800">${escHtml(step.category || '—')}</span>
+      ${confPill(step.confidence)}
+    </div>
+    ${confBar(step.confidence)}`;
+
+  if (prim === 'retrieve') {
+    const sources = step.sources || [];
+    return sources.length === 0 ? '<span class="text-sm text-slate-400">No sources recorded</span>' : `
+    <div class="flex flex-wrap gap-1.5">
+      ${sources.map(s => `<span class="text-xs font-mono bg-purple-50 text-purple-700 border border-purple-200 px-2 py-0.5 rounded">${escHtml(s)}</span>`).join('')}
+    </div>`;
+  }
+
+  if (prim === 'investigate') return `
+    ${step.finding ? `<p class="text-sm text-slate-700 leading-relaxed mb-2">${escHtml(step.finding)}</p>` : ''}
+    ${confBar(step.confidence)}
+    ${step.evidence_flags?.length ? `<div class="mt-2 flex flex-wrap gap-1">${step.evidence_flags.map(f=>`<span class="text-xs bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded">${escHtml(f)}</span>`).join('')}</div>` : ''}`;
+
+  if (prim === 'think') return `
+    ${step.decision ? `<div class="flex items-center gap-2 mb-2"><span class="font-semibold text-slate-800">${escHtml(step.decision)}</span>${confPill(step.confidence)}</div>` : ''}
+    ${confBar(step.confidence)}
+    ${step.reasoning ? `<details class="mt-2"><summary class="text-xs text-slate-400 cursor-pointer hover:text-slate-600">▼ Reasoning</summary><p class="mt-2 text-sm text-slate-600 leading-relaxed">${escHtml(step.reasoning)}</p></details>` : ''}`;
+
+  if (prim === 'verify') {
+    const ok = step.conforms;
+    return `<div class="flex items-center gap-3 mb-2">
+      <span class="text-xs font-medium border px-2.5 py-1 rounded-full ${ok ? 'text-green-700 bg-green-50 border-green-200' : 'text-red-700 bg-red-50 border-red-200'}">
+        ${ok === true ? '✓ Conforms' : ok === false ? '✗ Non-conforming' : '— Unknown'}
+      </span>
+      ${step.violations != null ? `<span class="text-xs text-slate-500">${step.violations} violation${step.violations !== 1 ? 's' : ''}</span>` : ''}
+    </div>${confBar(step.confidence)}`;
+  }
+
+  if (prim === 'challenge') {
+    const ok = step.survives;
+    return `<div class="flex items-center gap-3">
+      <span class="text-xs font-medium border px-2.5 py-1 rounded-full ${ok ? 'text-green-700 bg-green-50 border-green-200' : 'text-red-700 bg-red-50 border-red-200'}">
+        ${ok === true ? '✓ Survives' : ok === false ? '✗ Did not survive' : '— Unknown'}
+      </span>
+      ${step.vulnerabilities != null ? `<span class="text-xs text-slate-500">${step.vulnerabilities} vulnerabilit${step.vulnerabilities !== 1 ? 'ies' : 'y'}</span>` : ''}
+    </div>`;
+  }
+
+  if (prim === 'generate') {
+    const preview = step.artifact_preview || step.artifact || '';
+    return preview ? `<pre class="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded p-3 whitespace-pre-wrap overflow-x-auto max-h-64">${escHtml(String(preview).slice(0, 500))}${String(preview).length > 500 ? '…' : ''}</pre>` : '';
+  }
+
+  return `<pre class="text-xs text-slate-500">${escHtml(JSON.stringify(step, null, 2))}</pre>`;
+}
+
+// ── Decisions Tab ────────────────────────────────────────────────────
+function renderDecisionsTab(chain) {
+  const sections = [];
+
+  for (const inst of chain) {
+    const steps = inst.result?.steps || [];
+    const narratives = steps.filter(s => s.primitive === 'generate' && (s.artifact || s.artifact_preview));
+    const decisions = steps.filter(s => ['think','investigate','verify','challenge'].includes(s.primitive));
+
+    if (decisions.length === 0 && narratives.length === 0) continue;
+
+    sections.push(`<div class="mb-5">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
+        <span>${escHtml(workflowLabel(inst.workflow_type, inst.domain))}</span>
+      </div>`);
+
+    for (const step of decisions) {
+      const prim = step.primitive;
+      let content = '';
+      if (prim === 'think') {
+        content = `
+          ${step.decision ? `<div class="font-semibold text-slate-800 mb-1">${escHtml(step.decision)}</div>` : ''}
+          ${step.reasoning ? `<div class="text-sm text-slate-600 leading-relaxed">${escHtml(step.reasoning)}</div>` : ''}`;
+      } else if (prim === 'investigate') {
+        content = `<div class="text-sm text-slate-700 leading-relaxed">${escHtml(step.finding || '')}</div>`;
+      } else if (prim === 'verify') {
+        content = `<div class="text-sm">${step.conforms === true ? '✓ Conforms' : '✗ Non-conforming'} — ${step.violations || 0} violations</div>`;
+      } else if (prim === 'challenge') {
+        content = `<div class="text-sm">${step.survives ? '✓ Survives challenge' : '✗ Did not survive'} — ${step.vulnerabilities || 0} vulnerabilities</div>`;
+      }
+      if (content) {
+        sections.push(`
+          <div class="mb-3">
+            <div class="text-xs font-medium text-slate-400 mb-1">${prim} · ${escHtml(step.step_name || '')}</div>
+            ${content}
+          </div>`);
+      }
+    }
+
+    for (const step of narratives) {
+      const artifact = step.artifact || step.artifact_preview || '';
+      sections.push(`
+        <div class="mb-4">
+          <div class="text-xs font-medium text-slate-400 mb-1">Generated · ${escHtml(step.step_name || '')}</div>
+          <div class="narrative">${escHtml(String(artifact))}</div>
+        </div>`);
+    }
+
+    sections.push('</div>');
+  }
+
+  return sections.length > 0 ? sections.join('') :
+    `<p class="text-sm text-slate-400 italic">No decisions or narratives yet.</p>`;
+}
+
+// ── Metadata Tab ─────────────────────────────────────────────────────
+function renderMetaTab(chain, root) {
+  const totalElapsed = chain.reduce((s, i) => s + (i.elapsed_seconds || 0), 0);
+  const waitTime = chain.filter(i => isTerminal(i.status)).length > 0
+    ? (chain.find(i => isTerminal(i.status))?.updated_at || root.created_at) - root.created_at
+    : Date.now() / 1000 - root.created_at;
+
+  return `
+  <div class="mb-4">
+    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Timing</div>
+    <table class="data-table">
+      ${row('Started', new Date(root.created_at * 1000).toLocaleString())}
+      ${row('Total LLM Processing', totalElapsed.toFixed(1) + 's')}
+      ${row('Wall Clock Time', waitTime.toFixed(0) + 's')}
+    </table>
+  </div>
+  <div class="mb-4">
+    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Delegation Chain</div>
+    <table class="data-table">
+      <thead><tr><th>Workflow</th><th>Domain</th><th>Status</th><th>Steps</th><th>Time</th><th>Tier</th></tr></thead>
+      <tbody>
+        ${chain.map(inst => `<tr>
+          <td class="font-mono text-xs">${escHtml(inst.workflow_type)}</td>
+          <td class="text-xs">${escHtml(inst.domain)}</td>
+          <td><span class="text-xs ${statusInfo(inst.status).text}">${inst.status}</span></td>
+          <td class="text-right">${inst.step_count}</td>
+          <td>${inst.elapsed_seconds ? inst.elapsed_seconds.toFixed(1) + 's' : '—'}</td>
+          <td class="text-xs text-slate-400">${inst.governance_tier}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>
+  <div class="mb-4">
+    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Instance IDs</div>
+    <table class="data-table">
+      ${chain.map(inst => row(workflowLabel(inst.workflow_type, inst.domain), inst.instance_id)).join('')}
+    </table>
+  </div>`;
+}
+
+// ── Action Buttons ───────────────────────────────────────────────────
+function renderActionButtons(chain, suspended) {
+  const allTerminal = chain.every(i => isTerminal(i.status));
+  if (allTerminal) return '';  // completed/terminated — no actions
+
+  // Find suspended instance with a governance gate (pending_task = analyst action needed)
+  const gatedSuspended = chain.find(i => i.status === 'suspended' && i.pending_task);
+  if (gatedSuspended) {
+    const task = gatedSuspended.pending_task;
+    const taskId = task.task_id;
+    const corrId = gatedSuspended.correlation_id;
+    const instId = gatedSuspended.instance_id;
+
+    return `
+    <div class="bg-white rounded-xl border border-slate-200 p-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Analyst Actions</div>
+      <div class="flex flex-wrap gap-2">
+        <button onclick="openConfirm('approve', '${taskId}', '${corrId}')"
+          class="action-btn flex items-center gap-2 px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition-colors">
           ✓ Approve
         </button>
-        <button onclick="openRejectModal('${task.task_id}', '${inst.correlation_id}')"
-          class="px-5 py-2 bg-red-600 text-white font-medium text-sm rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2">
+        <button onclick="openConfirm('reject', '${taskId}', '${corrId}')"
+          class="action-btn flex items-center gap-2 px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors">
           ✗ Reject
         </button>
+        <button onclick="openConfirm('terminate', null, null, '${instId}')"
+          class="action-btn flex items-center gap-2 px-4 py-2 bg-slate-600 text-white text-sm font-medium rounded-lg hover:bg-slate-700 transition-colors">
+          ■ Terminate
+        </button>
       </div>
-    </div>
-  </div>`;
-}
-
-function renderInstanceSection(inst, allChain) {
-  const info = getStatusInfo(inst.status);
-  const isRunning = inst.status === 'running' || inst.status === 'created';
-  const steps = inst.result?.steps || [];
-  const hasError = inst.error;
-  const depth = inst.lineage.length;
-  const indent = depth > 0 ? `ml-${Math.min(depth * 4, 8)}` : '';
-
-  return `
-  <div class="bg-white rounded-xl border border-slate-200 overflow-hidden ${indent}">
-    <!-- Instance header -->
-    <div class="px-5 py-3 border-b border-slate-100 flex items-center justify-between gap-3">
-      <div class="flex items-center gap-3 min-w-0">
-        <div class="flex items-center gap-2">
-          ${depth > 0 ? `<span class="text-slate-300 text-sm">└</span>` : ''}
-          <span class="font-medium text-navy text-sm">${formatWorkflowLabel(inst.workflow_type, inst.domain)}</span>
-        </div>
-        <span class="flex items-center gap-1.5 text-xs font-medium ${info.textClass} ${info.bgClass} border ${info.borderClass} px-2 py-0.5 rounded-full shrink-0">
-          ${isRunning ? `<span class="pulse-dot w-1.5 h-1.5 rounded-full bg-current"></span>` : info.icon}
-          ${inst.status}
-        </span>
-        ${inst.governance_tier !== 'auto' ? `<span class="text-xs text-slate-400 shrink-0">${inst.governance_tier}</span>` : ''}
-      </div>
-      <div class="flex items-center gap-3 text-xs text-slate-400 shrink-0">
-        ${steps.length > 0 ? `<span>${steps.length} step${steps.length !== 1 ? 's' : ''}</span>` : ''}
-        ${inst.elapsed_seconds > 0 ? `<span>${inst.elapsed_seconds.toFixed(1)}s</span>` : ''}
-        <span class="font-mono text-slate-300">${inst.instance_id.slice(0, 14)}</span>
-      </div>
-    </div>
-
-    <!-- Error banner -->
-    ${hasError ? `
-    <div class="px-5 py-3 bg-red-50 border-b border-red-100 text-sm text-red-700">
-      <span class="font-medium">Error:</span> ${escapeHtml(inst.error)}
-    </div>` : ''}
-
-    <!-- Running placeholder -->
-    ${isRunning && steps.length === 0 ? `
-    <div class="px-5 py-4 flex items-center gap-3 text-slate-400 text-sm">
-      <span class="pulse-dot w-2 h-2 rounded-full bg-blue-400"></span>
-      Executing workflow...
-    </div>` : ''}
-
-    <!-- Step cards -->
-    ${steps.length > 0 ? `
-    <div class="divide-y divide-slate-100">
-      ${steps.map((step, i) => renderStepCard(step, inst.instance_id, i)).join('')}
-    </div>` : ''}
-
-    <!-- Work orders dispatched -->
-    ${inst.work_orders && inst.work_orders.length > 0 ? renderWorkOrders(inst.work_orders, allChain) : ''}
-  </div>`;
-}
-
-function renderWorkOrders(workOrders, allChain) {
-  if (!workOrders.length) return '';
-  return `
-  <div class="px-5 py-3 bg-slate-50 border-t border-slate-100">
-    <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Delegations Dispatched</div>
-    <div class="space-y-1">
-      ${workOrders.map(wo => {
-        const info = getStatusInfo(wo.status);
-        const handler = allChain.find(i => i.instance_id === wo.handler_instance_id);
-        return `
-        <div class="flex items-center gap-3 text-xs">
-          <span class="${info.textClass}">${info.icon}</span>
-          <span class="text-slate-600 font-medium">${formatWorkflowLabel(wo.handler_workflow_type, wo.handler_domain || '')}</span>
-          <span class="text-slate-400">${wo.mode || ''}</span>
-          <span class="${info.textClass} ${info.bgClass} border ${info.borderClass} px-1.5 py-0.5 rounded">${wo.status}</span>
-          ${handler ? `<span class="text-slate-300 font-mono">${wo.handler_instance_id.slice(0, 12)}</span>` : ''}
-        </div>`;
-      }).join('')}
-    </div>
-  </div>`;
-}
-
-// ── Step Cards ─────────────────────────────────────────────────────
-function renderStepCard(step, instanceId, idx) {
-  const prim = step.primitive || 'unknown';
-  const primInfo = getPrimitiveInfo(prim);
-  const cardId = `step-${instanceId}-${idx}`;
-
-  let bodyHtml = '';
-
-  switch (prim) {
-    case 'classify':
-      bodyHtml = renderClassifyBody(step);
-      break;
-    case 'retrieve':
-      bodyHtml = renderRetrieveBody(step);
-      break;
-    case 'investigate':
-      bodyHtml = renderInvestigateBody(step);
-      break;
-    case 'think':
-      bodyHtml = renderThinkBody(step);
-      break;
-    case 'verify':
-      bodyHtml = renderVerifyBody(step);
-      break;
-    case 'challenge':
-      bodyHtml = renderChallengeBody(step);
-      break;
-    case 'generate':
-      bodyHtml = renderGenerateBody(step);
-      break;
-    default:
-      bodyHtml = `<pre class="text-xs text-slate-500 overflow-x-auto">${escapeHtml(JSON.stringify(step, null, 2))}</pre>`;
+    </div>`;
   }
 
-  return `
-  <div class="step-card mx-3 my-2">
-    <div class="step-header" onclick="toggleStep('${cardId}')">
-      <span class="${primInfo.textClass} ${primInfo.bgClass} text-xs font-semibold px-2 py-0.5 rounded">${prim}</span>
-      <span class="font-medium text-slate-700 text-sm flex-1">${step.step_name || 'step'}</span>
-      ${renderConfidencePill(step.confidence)}
-      <span class="text-slate-300 text-xs step-toggle-icon" id="${cardId}-icon">▼</span>
-    </div>
-    <div id="${cardId}" style="display:none">
-      <div class="px-4 py-3 bg-white border-t border-slate-100 space-y-3">
-        ${bodyHtml}
+  // Suspended but no governance gate — waiting for child delegations; only terminate available
+  const delegationSuspended = chain.find(i => i.status === 'suspended');
+  if (delegationSuspended) {
+    return `
+    <div class="bg-white rounded-xl border border-slate-200 p-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Analyst Actions</div>
+      <div class="flex gap-2 items-center">
+        <span class="text-xs text-slate-400 italic">Waiting for sub-investigations…</span>
+        <button onclick="openConfirm('terminate', null, null, '${delegationSuspended.instance_id}')"
+          class="action-btn flex items-center gap-2 px-4 py-2 bg-slate-600 text-white text-sm font-medium rounded-lg hover:bg-slate-700 transition-colors">
+          ■ Terminate
+        </button>
       </div>
-    </div>
-  </div>`;
-}
-
-function toggleStep(cardId) {
-  const body = document.getElementById(cardId);
-  const icon = document.getElementById(cardId + '-icon');
-  if (!body) return;
-  const isOpen = body.style.display === 'block';
-  body.style.display = isOpen ? 'none' : 'block';
-  if (icon) icon.textContent = isOpen ? '▼' : '▲';
-}
-
-function renderConfidencePill(confidence) {
-  if (confidence == null) return '';
-  const pct = Math.round(confidence * 100);
-  const color = pct >= 80 ? 'text-green-700 bg-green-50 border-green-200'
-    : pct >= 60 ? 'text-yellow-700 bg-yellow-50 border-yellow-200'
-    : 'text-red-700 bg-red-50 border-red-200';
-  return `<span class="text-xs font-medium ${color} border px-1.5 py-0.5 rounded">${pct}%</span>`;
-}
-
-function renderConfidenceBar(confidence) {
-  if (confidence == null) return '';
-  const pct = Math.round(confidence * 100);
-  const color = pct >= 80 ? 'bg-green-500' : pct >= 60 ? 'bg-yellow-500' : 'bg-red-500';
-  return `
-  <div class="flex items-center gap-2">
-    <div class="flex-1 bg-slate-100 rounded-full h-2">
-      <div class="conf-bar-fill ${color} h-2 rounded-full" style="width:${pct}%"></div>
-    </div>
-    <span class="text-xs font-medium text-slate-600 w-8 text-right">${pct}%</span>
-  </div>`;
-}
-
-function renderClassifyBody(step) {
-  return `
-  <div class="flex items-center gap-3">
-    <span class="text-sm font-semibold text-slate-800">${escapeHtml(step.category || '—')}</span>
-    ${renderConfidencePill(step.confidence)}
-  </div>
-  ${step.confidence != null ? renderConfidenceBar(step.confidence) : ''}`;
-}
-
-function renderRetrieveBody(step) {
-  const sources = step.sources || [];
-  if (sources.length === 0) {
-    return `<span class="text-sm text-slate-400">No sources recorded</span>`;
+    </div>`;
   }
-  return `
-  <div class="space-y-1">
-    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Sources Fetched</div>
-    <div class="flex flex-wrap gap-2">
-      ${sources.map(s => `
-        <span class="text-xs bg-purple-50 text-purple-700 border border-purple-200 px-2 py-0.5 rounded font-mono">
-          ${escapeHtml(s)}
-        </span>`).join('')}
-    </div>
-  </div>`;
-}
 
-function renderInvestigateBody(step) {
-  return `
-  ${step.finding ? `
-  <div>
-    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Finding</div>
-    <p class="text-sm text-slate-700 leading-relaxed">${escapeHtml(step.finding)}</p>
-  </div>` : ''}
-  ${step.confidence != null ? `
-  <div>
-    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Confidence</div>
-    ${renderConfidenceBar(step.confidence)}
-  </div>` : ''}
-  ${step.evidence_flags && step.evidence_flags.length > 0 ? `
-  <div>
-    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Evidence Flags</div>
-    <div class="flex flex-wrap gap-1.5">
-      ${step.evidence_flags.map(f => `
-        <span class="text-xs bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded">${escapeHtml(f)}</span>
-      `).join('')}
-    </div>
-  </div>` : ''}
-  ${step.missing_evidence && step.missing_evidence.length > 0 ? `
-  <div>
-    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Missing Evidence</div>
-    <div class="flex flex-wrap gap-1.5">
-      ${step.missing_evidence.map(f => `
-        <span class="text-xs bg-slate-50 text-slate-500 border border-slate-200 px-2 py-0.5 rounded">${escapeHtml(f)}</span>
-      `).join('')}
-    </div>
-  </div>` : ''}`;
-}
-
-function renderThinkBody(step) {
-  return `
-  ${step.decision ? `
-  <div class="flex items-center gap-3">
-    <span class="text-sm font-semibold text-slate-800">${escapeHtml(step.decision)}</span>
-    ${renderConfidencePill(step.confidence)}
-  </div>` : ''}
-  ${step.recommendation && step.recommendation !== step.decision ? `
-  <div class="text-sm text-slate-600 italic">${escapeHtml(step.recommendation)}</div>` : ''}
-  ${step.confidence != null ? renderConfidenceBar(step.confidence) : ''}
-  ${step.reasoning ? `
-  <details class="text-sm">
-    <summary class="text-xs font-semibold text-slate-400 cursor-pointer hover:text-slate-600">▼ Reasoning</summary>
-    <p class="mt-2 text-slate-600 leading-relaxed text-sm">${escapeHtml(step.reasoning)}</p>
-  </details>` : ''}
-  ${step.thought ? `
-  <details class="text-sm">
-    <summary class="text-xs font-semibold text-slate-400 cursor-pointer hover:text-slate-600">▼ Thought process</summary>
-    <p class="mt-2 text-slate-600 leading-relaxed text-sm">${escapeHtml(step.thought)}</p>
-  </details>` : ''}
-  ${step.conclusions && step.conclusions.length > 0 ? `
-  <div>
-    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Conclusions</div>
-    <ul class="space-y-1">
-      ${step.conclusions.map(c => `<li class="text-sm text-slate-600 flex gap-2"><span class="text-slate-300">·</span>${escapeHtml(String(c))}</li>`).join('')}
-    </ul>
-  </div>` : ''}`;
-}
-
-function renderVerifyBody(step) {
-  const conformsColor = step.conforms ? 'text-green-700 bg-green-50 border-green-200' : 'text-red-700 bg-red-50 border-red-200';
-  const conformsLabel = step.conforms === true ? '✓ Conforms' : step.conforms === false ? '✗ Non-conforming' : '— Unknown';
-  return `
-  <div class="flex items-center gap-3">
-    <span class="text-xs font-medium ${conformsColor} border px-2.5 py-1 rounded-full">${conformsLabel}</span>
-    ${step.violations != null ? `<span class="text-xs text-slate-500">${step.violations} violation${step.violations !== 1 ? 's' : ''}</span>` : ''}
-  </div>
-  ${step.confidence != null ? renderConfidenceBar(step.confidence) : ''}`;
-}
-
-function renderChallengeBody(step) {
-  const survivesColor = step.survives ? 'text-green-700 bg-green-50 border-green-200' : 'text-red-700 bg-red-50 border-red-200';
-  const survivesLabel = step.survives === true ? '✓ Survives challenge' : step.survives === false ? '✗ Did not survive' : '— Unknown';
-  return `
-  <div class="flex items-center gap-3">
-    <span class="text-xs font-medium ${survivesColor} border px-2.5 py-1 rounded-full">${survivesLabel}</span>
-    ${step.vulnerabilities != null ? `<span class="text-xs text-slate-500">${step.vulnerabilities} vulnerabilit${step.vulnerabilities !== 1 ? 'ies' : 'y'}</span>` : ''}
-  </div>`;
-}
-
-function renderGenerateBody(step) {
-  const preview = step.artifact_preview || step.artifact || '';
-  const displayPreview = String(preview).slice(0, 300);
-  return `
-  ${displayPreview ? `
-  <div>
-    <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Artifact Preview</div>
-    <pre class="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded p-3 whitespace-pre-wrap overflow-x-auto max-h-48">${escapeHtml(displayPreview)}${preview.length > 300 ? '…' : ''}</pre>
-  </div>` : ''}
-  ${step.confidence != null ? renderConfidenceBar(step.confidence) : ''}`;
-}
-
-// ── Submit Case Modal ──────────────────────────────────────────────
-let availableCases = [];
-
-async function loadCasesForModal() {
-  try {
-    const res = await fetch('/api/cases');
-    if (!res.ok) return;
-    availableCases = await res.json();
-    const select = document.getElementById('submit-case-file');
-    select.innerHTML = availableCases.map(c =>
-      `<option value="${escapeAttr(c.path)}">${c.case_id} — ${formatFraudType(c.fraud_type)}</option>`
-    ).join('');
-    updateCaseDescription();
-    select.addEventListener('change', updateCaseDescription);
-  } catch (e) {
-    console.warn('Could not load cases:', e);
+  // Running — only terminate available
+  const runningInst = chain.find(i => ['running','created'].includes(i.status));
+  if (runningInst) {
+    return `
+    <div class="bg-white rounded-xl border border-slate-200 p-4">
+      <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Analyst Actions</div>
+      <div class="flex gap-2">
+        <button onclick="openConfirm('terminate', null, null, '${runningInst.instance_id}')"
+          class="action-btn flex items-center gap-2 px-4 py-2 bg-slate-600 text-white text-sm font-medium rounded-lg hover:bg-slate-700 transition-colors">
+          ■ Terminate
+        </button>
+      </div>
+    </div>`;
   }
+
+  return '';
 }
 
-function updateCaseDescription() {
-  const select = document.getElementById('submit-case-file');
-  const desc = document.getElementById('submit-case-desc');
-  const selected = availableCases.find(c => c.path === select.value);
-  desc.textContent = selected ? selected.description : '';
-}
+// ── Confirm Modal ────────────────────────────────────────────────────
+function openConfirm(type, taskId, corrId, instanceId) {
+  pendingConfirmAction = { type, taskId, corrId, instanceId };
 
-function openSubmitModal() {
-  document.getElementById('submit-modal').classList.remove('hidden');
-  document.getElementById('submit-btn').disabled = false;
-  document.getElementById('submit-btn').textContent = 'Run Workflow';
-}
+  const titles = { approve: 'Approve Governance Gate', reject: 'Reject Governance Gate',
+    terminate: 'Terminate Workflow', resume: 'Resume Workflow' };
+  const msgs = {
+    approve: 'Approving will finalize the workflow and execute any downstream delegations.',
+    reject: 'Rejecting will terminate this workflow instance. This cannot be undone.',
+    terminate: 'Terminating will stop all processing immediately. This cannot be undone.',
+    resume: 'Resume will re-run the workflow from the suspension point with optional input.',
+  };
+  const btnClasses = {
+    approve: 'bg-green-600 hover:bg-green-700',
+    reject: 'bg-red-600 hover:bg-red-700',
+    terminate: 'bg-slate-700 hover:bg-slate-800',
+    resume: 'bg-sky-600 hover:bg-sky-700',
+  };
+  const btnLabels = { approve: '✓ Approve', reject: '✗ Reject', terminate: '■ Terminate', resume: '▶ Resume' };
 
-function closeSubmitModal() {
-  document.getElementById('submit-modal').classList.add('hidden');
-}
-
-async function submitCase() {
-  const caseFile = document.getElementById('submit-case-file').value;
-  const workflow = document.getElementById('submit-workflow').value.trim();
-  const domain = document.getElementById('submit-domain').value.trim();
-
-  if (!caseFile) { showToast('Please select a case file'); return; }
-  if (!workflow) { showToast('Please enter a workflow'); return; }
-
-  const btn = document.getElementById('submit-btn');
-  btn.disabled = true;
-  btn.textContent = 'Submitting…';
-
-  try {
-    const res = await fetch('/api/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ case_file: caseFile, workflow, domain }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || 'Unknown error');
-    }
-
-    const data = await res.json();
-    closeSubmitModal();
-    showToast('Case submitted — workflow starting…');
-
-    // Refresh backlog and select the new case
-    await loadBacklog();
-    if (data.instance_id) {
-      await selectCase(data.instance_id);
-    }
-  } catch (e) {
-    showToast(`Error: ${e.message}`, 'error');
-    btn.disabled = false;
-    btn.textContent = 'Run Workflow';
-  }
-}
-
-// ── Approve / Reject ───────────────────────────────────────────────
-function openApproveModal(taskId, correlationId) {
-  pendingConfirmAction = { type: 'approve', taskId, correlationId };
-  document.getElementById('confirm-title').textContent = 'Approve Governance Gate';
-  document.getElementById('confirm-message').textContent =
-    'Review has been completed. Approving will finalize the workflow and execute any downstream delegations.';
-  document.getElementById('confirm-notes-label').textContent = 'Approval Notes';
-  document.getElementById('confirm-notes').placeholder = 'Optional approval notes...';
+  document.getElementById('confirm-title').textContent = titles[type];
+  document.getElementById('confirm-message').textContent = msgs[type];
+  document.getElementById('confirm-notes-label').textContent = type === 'reject' ? 'Rejection Reason (required)' : 'Notes';
   document.getElementById('confirm-notes').value = '';
   document.getElementById('confirm-analyst').value = 'analyst';
   const btn = document.getElementById('confirm-action-btn');
-  btn.className = 'px-5 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition-colors';
-  btn.textContent = '✓ Approve';
-  document.getElementById('confirm-modal').classList.remove('hidden');
-}
+  btn.className = `px-5 py-2 text-white text-sm font-medium rounded-lg transition-colors ${btnClasses[type]}`;
+  btn.textContent = btnLabels[type];
+  btn.disabled = false;
 
-function openRejectModal(taskId, correlationId) {
-  pendingConfirmAction = { type: 'reject', taskId, correlationId };
-  document.getElementById('confirm-title').textContent = 'Reject Governance Gate';
-  document.getElementById('confirm-message').textContent =
-    'Rejecting will terminate this workflow instance. This action cannot be undone.';
-  document.getElementById('confirm-notes-label').textContent = 'Rejection Reason';
-  document.getElementById('confirm-notes').placeholder = 'Required: reason for rejection...';
-  document.getElementById('confirm-notes').value = '';
-  document.getElementById('confirm-analyst').value = 'analyst';
-  const btn = document.getElementById('confirm-action-btn');
-  btn.className = 'px-5 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors';
-  btn.textContent = '✗ Reject';
   document.getElementById('confirm-modal').classList.remove('hidden');
 }
 
@@ -667,29 +888,55 @@ function closeConfirmModal() {
   pendingConfirmAction = null;
 }
 
+function confirmReset() {
+  if (!confirm('Reset all cases? This will delete all workflow instances from the database and cannot be undone.')) return;
+  resetAll();
+}
+
+async function resetAll() {
+  try {
+    const res = await fetch('/api/reset', { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({detail: res.statusText}))).detail);
+    selectedInstanceId = null;
+    activeDetailTab = 'member';
+    document.getElementById('tab-detail').innerHTML =
+      `<div class="p-8 text-slate-400 text-sm text-center">Select a case to view details.</div>`;
+    await loadBacklog();
+    showToast('All cases cleared');
+  } catch (e) {
+    showToast(`Reset failed: ${e.message}`, 'error');
+  }
+}
+
 async function executeConfirm() {
   if (!pendingConfirmAction) return;
-  const { type, taskId, correlationId } = pendingConfirmAction;
+  const { type, taskId, instanceId } = pendingConfirmAction;
   const analyst = document.getElementById('confirm-analyst').value.trim() || 'analyst';
   const notes = document.getElementById('confirm-notes').value.trim();
 
-  if (type === 'reject' && !notes) {
-    showToast('Rejection reason is required', 'error');
-    return;
-  }
+  if (type === 'reject' && !notes) { showToast('Rejection reason is required', 'error'); return; }
 
   const btn = document.getElementById('confirm-action-btn');
   btn.disabled = true;
-  btn.textContent = 'Processing…';
+  btn.innerHTML = `<span class="spinner"></span> Processing…`;
+
+  closeConfirmModal();
 
   try {
-    const endpoint = type === 'approve'
-      ? `/api/tasks/${taskId}/approve`
-      : `/api/tasks/${taskId}/reject`;
-
-    const body = type === 'approve'
-      ? { approver: analyst, notes }
-      : { rejector: analyst, reason: notes };
+    let endpoint, body;
+    if (type === 'approve') {
+      endpoint = `/api/tasks/${taskId}/approve`;
+      body = { approver: analyst, notes };
+    } else if (type === 'reject') {
+      endpoint = `/api/tasks/${taskId}/reject`;
+      body = { rejector: analyst, reason: notes };
+    } else if (type === 'terminate') {
+      endpoint = `/api/instances/${instanceId}/terminate`;
+      body = { reason: notes || 'Terminated by analyst' };
+    } else if (type === 'resume') {
+      endpoint = `/api/instances/${instanceId}/resume`;
+      body = { external_input: {}, resume_nonce: '' };
+    }
 
     const res = await fetch(endpoint, {
       method: 'POST',
@@ -702,94 +949,206 @@ async function executeConfirm() {
       throw new Error(err.detail || 'Unknown error');
     }
 
-    closeConfirmModal();
-    showToast(type === 'approve' ? 'Approved — workflow resuming…' : 'Rejected — workflow terminated');
+    const toastMsg = { approve: 'Approved — workflow resuming…', reject: 'Rejected',
+      terminate: 'Terminated', resume: 'Resumed — workflow processing…' };
+    showToast(toastMsg[type]);
 
-    // Restart chain polling to pick up state changes
+    // Restart chain polling
     if (selectedInstanceId) {
       if (chainPollingTimer) clearInterval(chainPollingTimer);
       chainPollingTimer = setInterval(async () => {
         const c = await loadChain(selectedInstanceId);
         if (!c || c.every(i => isTerminal(i.status))) {
-          clearInterval(chainPollingTimer);
-          chainPollingTimer = null;
+          clearInterval(chainPollingTimer); chainPollingTimer = null;
+          await loadBacklog();
         }
       }, 2000);
       await loadChain(selectedInstanceId);
     }
     await loadBacklog();
+
   } catch (e) {
     showToast(`Error: ${e.message}`, 'error');
-    btn.disabled = false;
-    btn.textContent = type === 'approve' ? '✓ Approve' : '✗ Reject';
   }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
+// ── Submit Modal ─────────────────────────────────────────────────────
+async function loadCasesForModal() {
+  try {
+    const res = await fetch('/api/cases');
+    if (!res.ok) return;
+    availableCases = await res.json();
+    const sel = document.getElementById('submit-case-file');
+    sel.innerHTML = availableCases.map(c =>
+      `<option value="${escAttr(c.path)}">${c.case_id} — ${formatFraudType(c.fraud_type)}</option>`
+    ).join('');
+    updateCaseDesc();
+    sel.addEventListener('change', updateCaseDesc);
+  } catch (e) {
+    console.warn('Could not load cases:', e);
+  }
+}
+
+function updateCaseDesc() {
+  const val = document.getElementById('submit-case-file').value;
+  const found = availableCases.find(c => c.path === val);
+  document.getElementById('submit-case-desc').textContent = found?.description || '';
+}
+
+function openSubmitModal() {
+  // Filter out cases already in the system (any stage except failed)
+  const activeCaseIds = new Set(
+    backlogData
+      .filter(c => c.stage !== 'failed')
+      .map(c => c.case_meta?.case_id)
+      .filter(Boolean)
+  );
+  const sel = document.getElementById('submit-case-file');
+  const filtered = availableCases.filter(c => !activeCaseIds.has(c.case_id));
+  sel.innerHTML = filtered.length
+    ? filtered.map(c => `<option value="${escAttr(c.path)}">${escHtml(c.case_id)} — ${formatFraudType(c.fraud_type)}</option>`).join('')
+    : `<option value="">All cases already submitted</option>`;
+  updateCaseDesc();
+  document.getElementById('submit-modal').classList.remove('hidden');
+  document.getElementById('submit-btn').disabled = !sel.value;
+  document.getElementById('submit-btn').textContent = 'Run Workflow';
+}
+
+function closeSubmitModal() {
+  document.getElementById('submit-modal').classList.add('hidden');
+}
+
+async function submitCase() {
+  const caseFile = document.getElementById('submit-case-file').value;
+  const workflow = document.getElementById('submit-workflow').value.trim();
+  const domain = document.getElementById('submit-domain').value.trim();
+  if (!caseFile) { showToast('Please select a case file'); return; }
+
+  const btn = document.getElementById('submit-btn');
+  btn.disabled = true;
+  btn.textContent = 'Submitting…';
+
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ case_file: caseFile, workflow, domain }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || 'Unknown error');
+    }
+    const data = await res.json();
+    closeSubmitModal();
+    await loadBacklog();
+    if (data.instance_id) {
+      await selectCase(data.instance_id);
+      // Scroll new card into view and briefly flash it
+      const card = document.querySelector(`[data-id="${data.instance_id}"]`);
+      if (card) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        card.style.transition = 'box-shadow 0.3s';
+        card.style.boxShadow = '0 0 0 3px #0ea5e9';
+        setTimeout(() => { card.style.boxShadow = ''; }, 1500);
+      }
+    }
+    const inst = backlogData.find(c => c.instance_id === data.instance_id);
+    const caseId = inst?.case_meta?.case_id || data.instance_id?.slice(-8).toUpperCase();
+    showToast(`Case ${caseId} submitted — workflow running`);
+  } catch (e) {
+    showToast(`Error: ${e.message}`, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Run Workflow';
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
 function isTerminal(status) {
   return ['completed', 'failed', 'terminated'].includes(status);
 }
 
-function getStatusInfo(status) {
-  switch (status) {
-    case 'running':
-    case 'created':
-      return { icon: '●', textClass: 'text-blue-700', bgClass: 'bg-blue-50', borderClass: 'border-blue-200', borderColor: 'blue-200' };
-    case 'suspended':
-      return { icon: '⏸', textClass: 'text-yellow-700', bgClass: 'bg-yellow-50', borderClass: 'border-yellow-200', borderColor: 'yellow-200' };
-    case 'completed':
-      return { icon: '✓', textClass: 'text-green-700', bgClass: 'bg-green-50', borderClass: 'border-green-200', borderColor: 'green-200' };
-    case 'failed':
-      return { icon: '✗', textClass: 'text-red-700', bgClass: 'bg-red-50', borderClass: 'border-red-200', borderColor: 'red-200' };
-    case 'terminated':
-      return { icon: '■', textClass: 'text-slate-700', bgClass: 'bg-slate-50', borderClass: 'border-slate-200', borderColor: 'slate-200' };
-    default:
-      return { icon: '○', textClass: 'text-slate-600', bgClass: 'bg-slate-50', borderClass: 'border-slate-200', borderColor: 'slate-200' };
-  }
-}
-
-function getPrimitiveInfo(prim) {
+function statusInfo(status) {
   const map = {
-    classify:    { textClass: 'text-blue-700',   bgClass: 'bg-blue-50'   },
-    retrieve:    { textClass: 'text-purple-700',  bgClass: 'bg-purple-50' },
-    investigate: { textClass: 'text-amber-700',   bgClass: 'bg-amber-50'  },
-    think:       { textClass: 'text-orange-700',  bgClass: 'bg-orange-50' },
-    verify:      { textClass: 'text-green-700',   bgClass: 'bg-green-50'  },
-    challenge:   { textClass: 'text-red-700',     bgClass: 'bg-red-50'    },
-    generate:    { textClass: 'text-teal-700',    bgClass: 'bg-teal-50'   },
-    act:         { textClass: 'text-pink-700',    bgClass: 'bg-pink-50'   },
+    running: { icon:'●', text:'text-sky-700',    bg:'bg-sky-50',    border:'border-sky-200' },
+    created: { icon:'●', text:'text-sky-700',    bg:'bg-sky-50',    border:'border-sky-200' },
+    suspended:{ icon:'⏸', text:'text-amber-700', bg:'bg-amber-50',  border:'border-amber-200' },
+    completed:{ icon:'✓', text:'text-green-700', bg:'bg-green-50',  border:'border-green-200' },
+    failed:   { icon:'✗', text:'text-red-700',   bg:'bg-red-50',    border:'border-red-200' },
+    terminated:{ icon:'■',text:'text-slate-600', bg:'bg-slate-50',  border:'border-slate-200' },
   };
-  return map[prim] || { textClass: 'text-slate-700', bgClass: 'bg-slate-50' };
+  return map[status] || { icon:'○', text:'text-slate-500', bg:'bg-slate-50', border:'border-slate-200' };
 }
 
-function formatCaseId(correlationId) {
-  // Show last 12 chars of correlation_id as a compact case handle
-  if (!correlationId) return '—';
-  return correlationId.slice(-12).toUpperCase();
+function primInfo(prim) {
+  const map = {
+    classify:   { text:'text-sky-700',    bg:'bg-sky-50' },
+    retrieve:   { text:'text-purple-700', bg:'bg-purple-50' },
+    investigate:{ text:'text-amber-700',  bg:'bg-amber-50' },
+    think:      { text:'text-orange-700', bg:'bg-orange-50' },
+    verify:     { text:'text-green-700',  bg:'bg-green-50' },
+    challenge:  { text:'text-red-700',    bg:'bg-red-50' },
+    generate:   { text:'text-teal-700',   bg:'bg-teal-50' },
+    act:        { text:'text-pink-700',   bg:'bg-pink-50' },
+  };
+  return map[prim] || { text:'text-slate-600', bg:'bg-slate-50' };
 }
 
-function formatDomain(domain) {
-  if (!domain) return '';
-  return domain.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+function priorityClass(p) {
+  const m = {
+    critical: 'bg-red-50 text-red-700 border-red-200',
+    high:     'bg-orange-50 text-orange-700 border-orange-200',
+    medium:   'bg-yellow-50 text-yellow-700 border-yellow-200',
+    low:      'bg-slate-50 text-slate-500 border-slate-200',
+  };
+  return m[p] || 'bg-slate-50 text-slate-500 border-slate-200';
 }
 
-function formatWorkflowLabel(workflowType, domain) {
-  // Use domain for more descriptive label when available
-  if (domain && domain !== workflowType) {
-    return formatDomain(domain);
-  }
-  return formatDomain(workflowType);
+function confPill(v) {
+  if (v == null) return '';
+  const pct = Math.round(v * 100);
+  const c = pct >= 80 ? 'text-green-700 bg-green-50 border-green-200'
+    : pct >= 60 ? 'text-yellow-700 bg-yellow-50 border-yellow-200'
+    : 'text-red-700 bg-red-50 border-red-200';
+  return `<span class="text-xs font-medium ${c} border px-1.5 py-0.5 rounded">${pct}%</span>`;
 }
 
-function formatFraudType(fraudType) {
-  if (!fraudType) return 'Unknown';
-  return fraudType.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+function confBar(v) {
+  if (v == null) return '';
+  const pct = Math.round(v * 100);
+  const c = pct >= 80 ? 'bg-green-500' : pct >= 60 ? 'bg-yellow-500' : 'bg-red-500';
+  return `<div class="flex items-center gap-2 my-1">
+    <div class="flex-1 bg-slate-100 rounded-full h-1.5">
+      <div class="conf-bar-fill ${c} h-1.5 rounded-full" style="width:${pct}%"></div>
+    </div>
+    <span class="text-xs text-slate-500 w-8 text-right">${pct}%</span>
+  </div>`;
+}
+
+function row(label, value) {
+  if (value == null || value === '' || value === undefined) return '';
+  return `<tr><td class="text-slate-500 font-medium w-40">${escHtml(String(label))}</td><td>${escHtml(String(value))}</td></tr>`;
+}
+
+function fmtAmount(n) {
+  if (n == null) return '0';
+  return Number(n).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+}
+
+function fmtSla(sla) {
+  if (!sla) return '';
+  try {
+    const d = new Date(sla);
+    const now = new Date();
+    const diff = d - now;
+    if (diff < 0) return 'SLA expired';
+    const h = Math.round(diff / 3600000);
+    return h < 1 ? 'SLA <1h' : `SLA ${h}h`;
+  } catch { return ''; }
 }
 
 function formatTimeAgo(ts) {
   if (!ts) return '';
-  const now = Date.now() / 1000;
-  const diff = now - ts;
+  const diff = Date.now() / 1000 - ts;
   if (diff < 5) return 'just now';
   if (diff < 60) return Math.round(diff) + 's ago';
   if (diff < 3600) return Math.round(diff / 60) + 'm ago';
@@ -797,25 +1156,32 @@ function formatTimeAgo(ts) {
   return Math.round(diff / 86400) + 'd ago';
 }
 
-function escapeHtml(str) {
-  if (str == null) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+function formatFraudType(ft) {
+  if (!ft) return '—';
+  return ft.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function escapeAttr(str) {
-  if (str == null) return '';
-  return String(str).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+function workflowLabel(wt, domain) {
+  const label = domain && domain !== wt ? domain : wt;
+  return label.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function showToast(message, type = 'info') {
-  const toast = document.getElementById('toast');
-  toast.textContent = message;
-  toast.style.background = type === 'error' ? '#dc2626' : '#1e293b';
-  toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 3500);
+function escHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function escAttr(s) {
+  if (s == null) return '';
+  return String(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function showToast(msg, type = 'info') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.background = type === 'error' ? '#dc2626' : '#1e293b';
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 3500);
 }

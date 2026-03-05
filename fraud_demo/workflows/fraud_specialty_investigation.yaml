@@ -73,6 +73,12 @@ steps:
       ${domain.think_determination.framework}
     focus: |
       ${domain.think_determination.framework}
+    additional_instructions: |
+      IMPORTANT: All case data has already been retrieved in the retrieve_evidence
+      step and fully analyzed in the investigate_activity step. The investigation
+      finding and evidence above is your complete basis for determination.
+      Do NOT emit resource_requests — set resource_requests to an empty array [].
+      Use only the evidence already present in context to make your determination.
   transitions:
   - default: generate_final_report
 

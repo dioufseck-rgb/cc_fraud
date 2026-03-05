@@ -60,6 +60,9 @@ class InstanceState:
     pending_work_orders: list[str] = field(default_factory=list)
     resume_nonce: str = ""
 
+    # Case metadata extracted from case_input at start time (for UI display)
+    case_meta: dict[str, Any] = field(default_factory=dict)
+
     # Result (populated on completion)
     result: dict[str, Any] | None = None
     error: str | None = None

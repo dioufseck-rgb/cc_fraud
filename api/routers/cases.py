@@ -46,28 +46,69 @@ class RunRequest(BaseModel):
     domain: str = "fraud_triage"
 
 
+def _compute_stage(chain: list, pending_instance_ids: set | None = None) -> str:
+    """Determine the current processing stage for a case from its full chain."""
+    # Suspended with a pending governance gate = needs analyst review
+    if any(i.status.value == "suspended" for i in chain):
+        if pending_instance_ids and any(
+            i.status.value == "suspended" and i.instance_id in pending_instance_ids
+            for i in chain
+        ):
+            return "needs_review"
+        # Suspended but no governance gate — waiting for delegations
+        return "investigation"
+    # Any instance actively running
+    active = [i for i in chain if i.status.value in ("running", "created")]
+    if active:
+        running_workflows = [i.workflow_type for i in active]
+        if any("specialty_investigation" in w or "regulatory" in w or "resolution" in w
+               for w in running_workflows):
+            return "investigation"
+        return "triage"
+    # All terminal — only "completed" if the root finished successfully
+    root = chain[0] if chain else None
+    if root and root.status.value == "completed":
+        return "completed"
+    return "failed"
+
+
 @router.get("/backlog")
 async def get_backlog() -> list[dict[str, Any]]:
     """
-    Return one entry per unique case (correlation chain).
-    Shows only root instances (lineage=[]) in reverse chronological order.
+    Return one entry per unique case (correlation chain), enriched with:
+      - stage: triage | investigation | needs_review | completed
+      - case_meta: key case facts (member name, fraud type, amount, etc.)
     """
     coord = deps.get_coordinator()
 
-    all_instances = coord.store.list_instances(limit=200)
+    all_instances = coord.store.list_instances(limit=500)
 
-    # Root instances: no lineage (first step in delegation chain)
+    # Group by correlation_id
+    from collections import defaultdict
+    by_corr: dict[str, list] = defaultdict(list)
+    for inst in all_instances:
+        by_corr[inst.correlation_id].append(inst)
+
+    # Root instances: no lineage, used as the case anchor
     root_instances = [i for i in all_instances if not i.lineage]
 
-    # Pending approvals indexed by correlation_id for has_pending_gate flag
     try:
         pending = coord.list_pending_approvals()
         pending_corr_ids = {p["correlation_id"] for p in pending}
+        pending_instance_ids = {p["instance_id"] for p in pending}
+        pending_task_by_corr = {p["correlation_id"]: p for p in pending}
     except Exception:
         pending_corr_ids: set[str] = set()
+        pending_instance_ids: set[str] = set()
+        pending_task_by_corr: dict = {}
 
     result = []
     for inst in root_instances:
+        chain = by_corr.get(inst.correlation_id, [inst])
+        stage = _compute_stage(chain, pending_instance_ids)
+        has_gate = inst.correlation_id in pending_corr_ids
+        pending_task = pending_task_by_corr.get(inst.correlation_id)
+
         result.append({
             "instance_id": inst.instance_id,
             "workflow_type": inst.workflow_type,
@@ -78,7 +119,10 @@ async def get_backlog() -> list[dict[str, Any]]:
             "created_at": inst.created_at,
             "elapsed_seconds": inst.elapsed_seconds,
             "step_count": inst.step_count,
-            "has_pending_gate": inst.correlation_id in pending_corr_ids,
+            "has_pending_gate": has_gate,
+            "pending_task": pending_task,
+            "stage": stage,
+            "case_meta": inst.case_meta,
         })
     return result
 
@@ -95,7 +139,7 @@ async def list_cases() -> list[dict[str, str]]:
             with open(p) as f:
                 data = json.load(f)
             case_id = data.get("case_id", p.stem)
-            description = data.get("description", "")[:100]
+            description = data.get("description", "")
             fraud_type = data.get("fraud_type", "unknown")
         except Exception:
             case_id = p.stem
@@ -159,6 +203,29 @@ async def run_case(req: RunRequest) -> dict[str, Any]:
         raise HTTPException(500, "Workflow did not appear in DB within 6 seconds")
 
     return {"instance_id": instance_id, "correlation_id": correlation_id}
+
+
+@router.post("/reset")
+async def reset_all() -> dict:
+    """
+    Clear all workflow instances from the database.
+    Terminates any running instances first, then wipes the tables.
+    """
+    coord = deps.get_coordinator()
+    try:
+        all_instances = coord.store.list_instances(limit=2000)
+        for inst in all_instances:
+            if inst.status.value in ("running", "created", "suspended"):
+                try:
+                    coord.terminate(instance_id=inst.instance_id, reason="Manual reset")
+                except Exception:
+                    pass
+        for table in ("action_ledger", "suspensions", "work_orders", "instances", "task_queue"):
+            coord.store.db.execute(f"DELETE FROM {table}")
+        coord.store.db.commit()
+        return {"status": "ok", "cleared": len(all_instances)}
+    except Exception as e:
+        raise HTTPException(500, f"Reset failed: {e}")
 
 
 def _run_workflow(coord, workflow: str, domain: str, case_input: dict, correlation_id: str):
