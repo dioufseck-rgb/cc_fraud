@@ -427,6 +427,36 @@ def create_node(
                 _causal_artifact = None
                 _causal_dag = None
 
+        # ── SDA policy injection for think primitive ────────────────────────
+        _sda_artifact = None
+        if primitive_name == "think":
+            try:
+                _domain = state.get("metadata", {}).get("domain", "")
+                from analytics.registry import AnalyticsRegistry
+                from analytics.sda_policy import (
+                    build_sda_context_block, extract_causal_finding
+                )
+                _reg = AnalyticsRegistry()
+                _eligible = _reg.list_eligible(
+                    {"domain": _domain}, artifact_type="sequential_decision"
+                )
+                if _eligible:
+                    _sda_artifact = _eligible[0]
+                    _causal_finding = extract_causal_finding(state)
+                    _sda_block = build_sda_context_block(
+                        _sda_artifact, causal_finding=_causal_finding
+                    )
+                    existing = resolved_params.get("additional_instructions", "")
+                    resolved_params["additional_instructions"] = (
+                        existing + "\n" + _sda_block if existing.strip() else _sda_block
+                    )
+            except Exception as _sda_err:
+                import logging as _log
+                _log.getLogger("cognitive_core.nodes").warning(
+                    "SDA policy injection failed for %s: %s", step_name, _sda_err
+                )
+                _sda_artifact = None
+
         rendered_prompt = render_prompt(primitive_name, resolved_params)
 
         # LLM call with tracing
@@ -511,6 +541,17 @@ def create_node(
                         output["evidential_gaps"] = parsed.get("evidential_gaps", [])
                         output["dag_divergence_flag"] = parsed.get("dag_divergence_flag", False)
                         output["integration_reasoning"] = parsed.get("integration_reasoning", "")
+                elif primitive_name == "think" and _sda_artifact is not None:
+                    output["thought"] = parsed.get("thought", parsed.get("reasoning", ""))
+                    output["conclusions"] = parsed.get("conclusions", [])
+                    output["decision"] = parsed.get("decision")
+                    _sda_fields = [
+                        "policy_class", "policy_version", "reward_specification_version",
+                        "decision_horizon", "expected_value_by_horizon",
+                        "policy_recommendation", "causal_consistency_check", "tension_flags",
+                    ]
+                    for _sf in _sda_fields:
+                        output[_sf] = parsed.get(_sf, [] if _sf == "tension_flags" else (0 if _sf == "decision_horizon" else ""))
                 elif primitive_name == "classify":
                     output["category"] = parsed.get("category", "unknown")
                     output["alternative_categories"] = parsed.get("alternative_categories", [])
@@ -528,6 +569,16 @@ def create_node(
                     output = validated.model_dump()
                 except Exception as e_dump:
                     raise ValueError(f"model_dump failed: {type(e_dump).__name__}: {e_dump}") from e_dump
+                # Extend with SDA fields if policy was injected (additive only)
+                if primitive_name == "think" and _sda_artifact is not None:
+                    _sda_fields = [
+                        "policy_class", "policy_version", "reward_specification_version",
+                        "decision_horizon", "expected_value_by_horizon",
+                        "policy_recommendation", "causal_consistency_check", "tension_flags",
+                    ]
+                    for _sf in _sda_fields:
+                        if _sf not in output:
+                            output[_sf] = parsed.get(_sf, [] if _sf == "tension_flags" else (0 if _sf == "decision_horizon" else ""))
                 # Extend with causal fields if DAG was injected (additive only)
                 if primitive_name == "investigate" and _causal_dag is not None:
                     _causal_fields = [
@@ -617,6 +668,28 @@ def create_node(
             "data_sources": data_sources,
             "iteration": iteration,
         }
+
+        # ── SDA policy proof events ────────────────────────────────────────
+        if primitive_name == "think" and _sda_artifact is not None:
+            try:
+                _gov_sda = get_governance()
+                _tension = output.get("tension_flags", [])
+                _gov_sda._record_proof(
+                    "sda_policy_invoked",
+                    step=step_name,
+                    artifact_name=_sda_artifact.get("artifact_name", ""),
+                    policy_recommendation=output.get("policy_recommendation", ""),
+                    causal_consistency_check=output.get("causal_consistency_check", "not_applicable"),
+                )
+                if _tension:
+                    _gov_sda._record_proof(
+                        "causal_tension_flagged",
+                        step=step_name,
+                        artifact_name=_sda_artifact.get("artifact_name", ""),
+                        tension_flags=_tension,
+                    )
+            except Exception:
+                pass
 
         # ── DAG traversal proof event ──────────────────────────────────────
         if primitive_name == "investigate" and _causal_dag is not None:
