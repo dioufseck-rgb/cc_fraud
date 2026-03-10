@@ -396,6 +396,37 @@ def create_node(
             else:
                 resolved_params["input"] = json.dumps(input_data, indent=2)
 
+        # ── Causal DAG injection for investigate primitive ──────────────────
+        _causal_artifact = None
+        _causal_dag = None
+        if primitive_name == "investigate":
+            try:
+                _domain = state.get("metadata", {}).get("domain", "")
+                from analytics.registry import AnalyticsRegistry
+                from analytics.causal_dag import load_dag_for_artifact, build_causal_context_block
+                _reg = AnalyticsRegistry()
+                _eligible = _reg.list_eligible({"domain": _domain}, artifact_type="causal_dag")
+                if _eligible:
+                    _causal_artifact = _eligible[0]
+                    _causal_dag = load_dag_for_artifact(_causal_artifact)
+                    if _causal_dag:
+                        _causal_block = build_causal_context_block(
+                            _causal_dag,
+                            artifact_name=_causal_artifact["artifact_name"],
+                            dag_origin=_causal_artifact.get("dag_config", {}).get("dag_origin", "pre_existing"),
+                        )
+                        existing = resolved_params.get("additional_instructions", "")
+                        resolved_params["additional_instructions"] = (
+                            existing + "\n" + _causal_block if existing.strip() else _causal_block
+                        )
+            except Exception as _dag_err:
+                import logging as _log
+                _log.getLogger("cognitive_core.nodes").warning(
+                    "Causal DAG injection failed for %s: %s", step_name, _dag_err
+                )
+                _causal_artifact = None
+                _causal_dag = None
+
         rendered_prompt = render_prompt(primitive_name, resolved_params)
 
         # LLM call with tracing
@@ -471,6 +502,15 @@ def create_node(
                     output["finding"] = parsed.get("finding", "")
                     output["hypotheses_tested"] = parsed.get("hypotheses_tested", [])
                     output["recommended_actions"] = parsed.get("recommended_actions", [])
+                    if _causal_dag is not None:
+                        output["causal_templates_invoked"] = parsed.get("causal_templates_invoked", [])
+                        output["dag_version"] = parsed.get("dag_version", _causal_dag.get("dag_id", ""))
+                        output["activated_paths"] = parsed.get("activated_paths", [])
+                        output["alternative_paths_considered"] = parsed.get("alternative_paths_considered", [])
+                        output["unobserved_nodes"] = parsed.get("unobserved_nodes", [])
+                        output["evidential_gaps"] = parsed.get("evidential_gaps", [])
+                        output["dag_divergence_flag"] = parsed.get("dag_divergence_flag", False)
+                        output["integration_reasoning"] = parsed.get("integration_reasoning", "")
                 elif primitive_name == "classify":
                     output["category"] = parsed.get("category", "unknown")
                     output["alternative_categories"] = parsed.get("alternative_categories", [])
@@ -488,6 +528,16 @@ def create_node(
                     output = validated.model_dump()
                 except Exception as e_dump:
                     raise ValueError(f"model_dump failed: {type(e_dump).__name__}: {e_dump}") from e_dump
+                # Extend with causal fields if DAG was injected (additive only)
+                if primitive_name == "investigate" and _causal_dag is not None:
+                    _causal_fields = [
+                        "causal_templates_invoked", "dag_version", "activated_paths",
+                        "alternative_paths_considered", "unobserved_nodes",
+                        "evidential_gaps", "dag_divergence_flag", "integration_reasoning",
+                    ]
+                    for _cf in _causal_fields:
+                        if _cf not in output:
+                            output[_cf] = parsed.get(_cf, [] if _cf.endswith("s") else (False if _cf.endswith("flag") else ""))
         except Exception as e:
             import traceback
             get_trace().on_parse_error(step_name,
@@ -567,6 +617,21 @@ def create_node(
             "data_sources": data_sources,
             "iteration": iteration,
         }
+
+        # ── DAG traversal proof event ──────────────────────────────────────
+        if primitive_name == "investigate" and _causal_dag is not None:
+            try:
+                _gov_dag = get_governance()
+                _gov_dag._record_proof(
+                    "dag_traversal_completed",
+                    step=step_name,
+                    artifact_name=_causal_artifact.get("artifact_name", ""),
+                    dag_id=_causal_dag.get("dag_id", ""),
+                    activated_paths=output.get("activated_paths", []),
+                    dag_divergence_flag=output.get("dag_divergence_flag", False),
+                )
+            except Exception:
+                pass
 
         return {
             "steps": [step_result],
