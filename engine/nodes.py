@@ -396,6 +396,136 @@ def create_node(
             else:
                 resolved_params["input"] = json.dumps(input_data, indent=2)
 
+        # ── Two-stage verify (Stage 1: LLM evidence mapping, Stage 2: deterministic) ──
+        if primitive_name == "verify":
+            try:
+                _domain = state.get("metadata", {}).get("domain", "")
+                from analytics.registry import AnalyticsRegistry
+                _reg = AnalyticsRegistry()
+                _eligible_cc = _reg.list_eligible(
+                    {"domain": _domain}, artifact_type="constraint_checker"
+                )
+                if _eligible_cc:
+                    _cc_artifact = _eligible_cc[0]
+                    from analytics.constraint_checker import (
+                        build_stage1_prompt, evaluate_rules,
+                        Stage1Result, CHECKER_VERSION
+                    )
+                    import time as _time
+
+                    # ── Stage 1: LLM evidence mapping ──
+                    _s1_prompt = build_stage1_prompt(
+                        artifact=_cc_artifact,
+                        subject=resolved_params.get("subject", ""),
+                        context=resolved_params.get("context", ""),
+                        input_data=resolved_params.get("input", ""),
+                    )
+                    _gov_s1 = get_governance()
+                    _s1_result = _gov_s1.protected_llm_call(
+                        llm=llm,
+                        prompt=_s1_prompt,
+                        step_name=f"{step_name}:stage1",
+                        domain=_domain,
+                        model=model,
+                        case_input=state.get("input", {}),
+                    )
+                    _s1_raw = _s1_result.raw_response
+                    _s1_parsed = extract_json(_s1_raw) or {}
+                    _stage1 = Stage1Result.from_dict(_s1_parsed, raw_response=_s1_raw)
+                    _stage1.llm_version = model
+
+                    # Record Stage 1 proof event
+                    _gov_s1._record_proof(
+                        "evidence_mapping_recorded",
+                        step=step_name,
+                        artifact_name=_cc_artifact.get("artifact_name", ""),
+                        llm_version=model,
+                        has_ambiguity=_stage1.has_ambiguity(),
+                        ambiguity_summary=_stage1.ambiguity_summary(),
+                    )
+
+                    # ── Stage 2: Deterministic rule evaluation ──
+                    _stage2 = evaluate_rules(_cc_artifact, _stage1)
+
+                    # Record Stage 2 proof event
+                    _gov_s1._record_proof(
+                        "constraint_check_completed",
+                        step=step_name,
+                        artifact_name=_cc_artifact.get("artifact_name", ""),
+                        checker_version=CHECKER_VERSION,
+                        overall_conforms=_stage2.overall_conforms,
+                        rules_count=len(_stage2.rules_evaluated),
+                        violation_count=len(_stage2.violations),
+                    )
+
+                    # Check ambiguity escalation
+                    _ambiguity_escalation = _cc_artifact.get("ambiguity_escalation", "")
+                    _ambiguity_triggered = _stage1.has_ambiguity() and _ambiguity_escalation in ("gate", "hold", "escalate")
+
+                    # Build combined output
+                    _verify_output = {
+                        "conforms": _stage2.overall_conforms,
+                        "violations": [
+                            {
+                                "rule": v.rule_id,
+                                "description": v.description,
+                                "severity": "major",
+                                "location": "",
+                                "verdict": v.verdict,
+                                "rationale": v.rationale,
+                            }
+                            for v in _stage2.violations
+                        ],
+                        "rules_checked": [r.rule_id for r in _stage2.rules_evaluated],
+                        "confidence": 0.95 if _stage2.overall_conforms else 0.9,
+                        "reasoning": f"Two-stage verification: Stage 1 evidence mapping + Stage 2 deterministic rule evaluation.",
+                        "evidence_used": [{"source": "stage1", "description": "Evidence characterizations"}],
+                        "evidence_missing": [],
+                        "resource_requests": [],
+                        # V2 fields
+                        "rules_evaluated": _stage2.to_dict()["rules_evaluated"],
+                        "evidence_characterizations": _stage1.to_dict()["characterizations"],
+                        "stage1_llm_version": model,
+                        "stage2_checker_version": CHECKER_VERSION,
+                        "ambiguity_triggered_escalation": _ambiguity_triggered,
+                    }
+
+                    _verify_step_result: StepResult = {
+                        "step_name": step_name,
+                        "primitive": primitive_name,
+                        "output": _verify_output,
+                        "raw_response": _s1_raw,
+                        "prompt_used": _s1_prompt,
+                        "agent": f"sar-verify-v2",
+                        "model": model,
+                        "elapsed": 0.0,
+                        "tokens": None,
+                        "data_sources": [],
+                        "iteration": iteration,
+                    }
+                    return {
+                        "steps": [_verify_step_result],
+                        "current_step": step_name,
+                        "loop_counts": current_counts,
+                    }
+            except Exception as _v2_err:
+                import logging as _log
+                _log.getLogger("cognitive_core.nodes").warning(
+                    "Two-stage verify failed for %s, falling back to v1: %s",
+                    step_name, _v2_err
+                )
+                # Record fallback
+                try:
+                    _gov_fb = get_governance()
+                    _gov_fb._record_proof(
+                        "analytics_fallback_applied",
+                        step=step_name,
+                        reason=str(_v2_err),
+                        fallback="v1_single_stage",
+                    )
+                except Exception:
+                    pass
+
         # ── Causal DAG injection for investigate primitive ──────────────────
         _causal_artifact = None
         _causal_dag = None
