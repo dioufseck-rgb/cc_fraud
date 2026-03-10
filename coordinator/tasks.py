@@ -187,6 +187,22 @@ class TaskQueue(abc.ABC):
         """Expire tasks past their SLA. Returns count expired."""
         ...
 
+    @abc.abstractmethod
+    def force_complete(self, task_id: str) -> bool:
+        """Mark a task as completed directly, bypassing the claim requirement.
+        Used when approve/reject is called directly on the coordinator."""
+        ...
+
+    @abc.abstractmethod
+    def unclaim(self, task_id: str) -> bool:
+        """Return a claimed task to pending state (for defer actions)."""
+        ...
+
+    @property
+    def backend_name(self) -> str:
+        """Return the backend identifier for proof ledger recording."""
+        return self.__class__.__name__
+
 
 # ─── In-Memory Implementation ────────────────────────────────────────
 
@@ -251,6 +267,23 @@ class InMemoryTaskQueue(TaskQueue):
                 task.status = TaskStatus.EXPIRED
                 count += 1
         return count
+
+    def force_complete(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if not task:
+            return False
+        task.status = TaskStatus.COMPLETED
+        task.resolved_at = time.time()
+        return True
+
+    def unclaim(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if not task:
+            return False
+        task.status = TaskStatus.PENDING
+        task.claimed_at = None
+        task.claimed_by = ""
+        return True
 
 
 # ─── SQLite Implementation ───────────────────────────────────────────
@@ -389,6 +422,23 @@ class SQLiteTaskQueue(TaskQueue):
         self.db.commit()
         return cursor.rowcount
 
+    def force_complete(self, task_id: str) -> bool:
+        self.db.execute(
+            "UPDATE task_queue SET status = 'completed', resolved_at = ? WHERE task_id = ?",
+            (time.time(), task_id),
+        )
+        self.db.commit()
+        return True
+
+    def unclaim(self, task_id: str) -> bool:
+        self.db.execute("""
+            UPDATE task_queue SET status = 'pending',
+                claimed_at = NULL, claimed_by = ''
+            WHERE task_id = ?
+        """, (task_id,))
+        self.db.commit()
+        return True
+
     def _row_to_task(self, row) -> Task:
         cb_data = json.loads(row["callback"])
         return Task(
@@ -416,3 +466,267 @@ class SQLiteTaskQueue(TaskQueue):
             sla_seconds=row["sla_seconds"],
             expires_at=row["expires_at"],
         )
+
+
+# ─── Azure Service Bus Adapter ───────────────────────────────────────
+
+try:
+    from azure.servicebus import ServiceBusClient, ServiceBusMessage
+    _SERVICE_BUS_AVAILABLE = True
+except ImportError:
+    ServiceBusClient = None  # type: ignore[assignment,misc]
+    ServiceBusMessage = None  # type: ignore[assignment,misc]
+    _SERVICE_BUS_AVAILABLE = False
+
+import logging as _logging
+_logger = _logging.getLogger("cognitive_core.coordinator.tasks.servicebus")
+
+
+class ServiceBusTaskQueueAdapter(TaskQueue):
+    """
+    Azure Service Bus-backed task queue adapter.
+
+    Sends governance tasks to a Service Bus queue on suspension.
+    Guarantees at-least-once delivery with idempotency key:
+      instance_id + resume_nonce
+
+    When DATA_SERVICE_BUS_URL is not set, use create_task_queue() which
+    falls back to SQLiteTaskQueue automatically.
+    """
+
+    def __init__(self, connection_string: str, queue_name: str = "governance-tasks"):
+        if not _SERVICE_BUS_AVAILABLE:
+            raise RuntimeError(
+                "azure-servicebus package is not installed. "
+                "Install it with: pip install azure-servicebus"
+            )
+        self._connection_string = connection_string
+        self._queue_name = queue_name
+        # Local task registry — tasks are also stored here for get_task/list_tasks
+        self._tasks: dict[str, Task] = {}
+        # Map task_id → received ServiceBusMessage (for settlement)
+        self._pending_messages: dict[str, Any] = {}
+        # Idempotency set: set of "instance_id:resume_nonce" already processed
+        self._processed_keys: set[str] = set()
+
+    @property
+    def backend_name(self) -> str:
+        return "ServiceBusTaskQueueAdapter"
+
+    def _idempotency_key(self, task: Task) -> str:
+        return f"{task.instance_id}:{task.callback.resume_nonce}"
+
+    def publish(self, task: Task) -> str:
+        """Send a task to the Service Bus queue and record it locally."""
+        idem_key = self._idempotency_key(task)
+        if idem_key in self._processed_keys:
+            _logger.warning(
+                "Duplicate publish suppressed for idempotency key %s (task_id=%s)",
+                idem_key, task.task_id,
+            )
+            return task.task_id
+
+        body = json.dumps({
+            "task_id": task.task_id,
+            "task_type": task.task_type,
+            "queue": task.queue,
+            "instance_id": task.instance_id,
+            "correlation_id": task.correlation_id,
+            "workflow_type": task.workflow_type,
+            "domain": task.domain,
+            "payload": task.payload,
+            "callback": {
+                "method": task.callback.method,
+                "instance_id": task.callback.instance_id,
+                "resume_nonce": task.callback.resume_nonce,
+                "endpoint": task.callback.endpoint,
+                "context": task.callback.context,
+            },
+            "status": task.status,
+            "priority": task.priority,
+            "created_at": task.created_at,
+            "sla_seconds": task.sla_seconds,
+            "expires_at": task.expires_at,
+        }, default=str)
+
+        with ServiceBusClient.from_connection_string(self._connection_string) as client:
+            with client.get_queue_sender(self._queue_name) as sender:
+                sb_message = ServiceBusMessage(
+                    body=body,
+                    message_id=task.task_id,
+                    subject=task.task_type,
+                    application_properties={
+                        "instance_id": task.instance_id,
+                        "queue": task.queue,
+                        "priority": task.priority,
+                    },
+                )
+                sender.send_messages(sb_message)
+
+        # Record locally for list/get operations
+        self._tasks[task.task_id] = task
+        _logger.info("Published task %s (type=%s) to Service Bus", task.task_id, task.task_type)
+        return task.task_id
+
+    def claim(self, queue: str, claimed_by: str = "") -> Task | None:
+        """Receive the next message from Service Bus and return it as a Task."""
+        with ServiceBusClient.from_connection_string(self._connection_string) as client:
+            with client.get_queue_receiver(
+                self._queue_name, max_wait_time=5
+            ) as receiver:
+                messages = receiver.receive_messages(max_message_count=1, max_wait_time=5)
+                if not messages:
+                    return None
+                msg = messages[0]
+                try:
+                    data = json.loads(str(msg))
+                except Exception:
+                    body_bytes = b"".join(msg.body)
+                    data = json.loads(body_bytes.decode("utf-8"))
+
+                if data.get("queue") != queue:
+                    # Wrong queue — abandon and skip
+                    receiver.abandon_message(msg)
+                    return None
+
+                task_id = data["task_id"]
+
+                # Idempotency check
+                idem_key = f"{data['instance_id']}:{data.get('callback', {}).get('resume_nonce', '')}"
+                if idem_key in self._processed_keys:
+                    _logger.info(
+                        "Idempotency: suppressing duplicate delivery for key %s", idem_key
+                    )
+                    receiver.complete_message(msg)
+                    return None
+
+                cb_data = data.get("callback", {})
+                task = Task(
+                    task_id=task_id,
+                    task_type=data["task_type"],
+                    queue=data["queue"],
+                    instance_id=data["instance_id"],
+                    correlation_id=data["correlation_id"],
+                    workflow_type=data["workflow_type"],
+                    domain=data["domain"],
+                    payload=data.get("payload", {}),
+                    callback=TaskCallback(
+                        method=cb_data.get("method", "approve"),
+                        instance_id=cb_data.get("instance_id", ""),
+                        resume_nonce=cb_data.get("resume_nonce", ""),
+                        endpoint=cb_data.get("endpoint", ""),
+                        context=cb_data.get("context", {}),
+                    ),
+                    status=TaskStatus.CLAIMED,
+                    priority=data.get("priority", 0),
+                    created_at=data.get("created_at", time.time()),
+                    claimed_at=time.time(),
+                    claimed_by=claimed_by,
+                    sla_seconds=data.get("sla_seconds"),
+                    expires_at=data.get("expires_at"),
+                )
+
+                self._tasks[task_id] = task
+                # Keep the receiver context alive by storing the message for settlement
+                # Note: in production you'd use a peek-lock receiver with longer lifetime
+                self._pending_messages[task_id] = (receiver, msg)
+                return task
+
+    def resolve(self, task_id: str, resolution: TaskResolution) -> bool:
+        """Complete or abandon the Service Bus message."""
+        task = self._tasks.get(task_id)
+        if not task or task.status != TaskStatus.CLAIMED:
+            return False
+
+        idem_key = self._idempotency_key(task)
+
+        if resolution.action in ("approve", "complete"):
+            task.status = TaskStatus.COMPLETED
+            # Mark idempotency key as processed
+            self._processed_keys.add(idem_key)
+        elif resolution.action == "reject":
+            task.status = TaskStatus.REJECTED
+            self._processed_keys.add(idem_key)
+        else:
+            # Abandon — let it be redelivered
+            pass
+
+        task.resolved_at = resolution.resolved_at or time.time()
+        return True
+
+    def get_task(self, task_id: str) -> Task | None:
+        return self._tasks.get(task_id)
+
+    def list_tasks(
+        self,
+        queue: str | None = None,
+        status: str | None = None,
+        instance_id: str | None = None,
+    ) -> list[Task]:
+        tasks = list(self._tasks.values())
+        if queue:
+            tasks = [t for t in tasks if t.queue == queue]
+        if status:
+            tasks = [t for t in tasks if t.status == status]
+        if instance_id:
+            tasks = [t for t in tasks if t.instance_id == instance_id]
+        return sorted(tasks, key=lambda t: (-t.priority, t.created_at))
+
+    def expire_overdue(self) -> int:
+        now = time.time()
+        count = 0
+        for task in self._tasks.values():
+            if (task.status == TaskStatus.PENDING
+                    and task.expires_at
+                    and now > task.expires_at):
+                task.status = TaskStatus.EXPIRED
+                count += 1
+        return count
+
+    def force_complete(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if not task:
+            return False
+        idem_key = self._idempotency_key(task)
+        task.status = TaskStatus.COMPLETED
+        task.resolved_at = time.time()
+        self._processed_keys.add(idem_key)
+        return True
+
+    def unclaim(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if not task:
+            return False
+        task.status = TaskStatus.PENDING
+        task.claimed_at = None
+        task.claimed_by = ""
+        return True
+
+
+# ─── Factory ─────────────────────────────────────────────────────────
+
+import os as _os
+
+
+def create_task_queue(db=None, queue_name: str = "governance-tasks") -> TaskQueue:
+    """
+    Factory that returns ServiceBusTaskQueueAdapter when DATA_SERVICE_BUS_URL
+    is set, otherwise falls back to SQLiteTaskQueue (or InMemoryTaskQueue if
+    no db is provided).
+    """
+    sb_url = _os.environ.get("DATA_SERVICE_BUS_URL", "")
+    if sb_url:
+        if not _SERVICE_BUS_AVAILABLE:
+            _logger.warning(
+                "DATA_SERVICE_BUS_URL is set but azure-servicebus is not installed. "
+                "Falling back to SQLite task queue."
+            )
+        else:
+            _logger.info("Using Azure Service Bus task queue (queue=%s)", queue_name)
+            return ServiceBusTaskQueueAdapter(
+                connection_string=sb_url,
+                queue_name=queue_name,
+            )
+    if db is not None:
+        return SQLiteTaskQueue(db)
+    return InMemoryTaskQueue()

@@ -32,6 +32,7 @@ from coordinator.policy import PolicyEngine, load_policy_engine, GovernanceDecis
 from coordinator.tasks import (
     TaskQueue, SQLiteTaskQueue, InMemoryTaskQueue,
     Task, TaskType, TaskStatus, TaskCallback, TaskResolution,
+    create_task_queue,
 )
 
 # Dispatch optimization (optional — graceful degradation if not configured)
@@ -131,7 +132,7 @@ class Coordinator:
         if task_queue:
             self.tasks = task_queue
         else:
-            self.tasks = SQLiteTaskQueue(self.store.db)
+            self.tasks = create_task_queue(db=self.store.db)
 
         # Workflow/domain resolution paths
         # Resolve relative to config file directory (not cwd)
@@ -581,16 +582,7 @@ class Coordinator:
         )
         for task in pending_tasks:
             if task.task_type == TaskType.GOVERNANCE_APPROVAL:
-                if isinstance(self.tasks, SQLiteTaskQueue):
-                    self.tasks.db.execute(
-                        "UPDATE task_queue SET status = 'completed', resolved_at = ?"
-                        " WHERE task_id = ?",
-                        (time.time(), task.task_id),
-                    )
-                    self.tasks.db.commit()
-                elif isinstance(self.tasks, InMemoryTaskQueue):
-                    task.status = TaskStatus.COMPLETED
-                    self.tasks._tasks[task.task_id] = task
+                self.tasks.force_complete(task.task_id)
                 break
 
         # Mark completed
@@ -788,19 +780,7 @@ class Coordinator:
             # Unclaim: set back to pending
             task_obj = self.tasks.get_task(task_id)
             if task_obj:
-                task_obj.status = TaskStatus.PENDING
-                task_obj.claimed_at = None
-                task_obj.claimed_by = ""
-                # Update in-place (SQLite uses INSERT OR REPLACE, InMemory updates dict)
-                if isinstance(self.tasks, SQLiteTaskQueue):
-                    self.tasks.db.execute("""
-                        UPDATE task_queue SET status = 'pending',
-                            claimed_at = NULL, claimed_by = ''
-                        WHERE task_id = ?
-                    """, (task_id,))
-                    self.tasks.db.commit()
-                elif isinstance(self.tasks, InMemoryTaskQueue):
-                    self.tasks._tasks[task_id] = task_obj
+                self.tasks.unclaim(task_id)
             return task_obj.instance_id if task_obj else ""
         else:
             raise ValueError(f"Unknown action: {action}")
@@ -1125,6 +1105,22 @@ class Coordinator:
         )
         task_id = self.tasks.publish(task)
 
+        # Record which backend handled this governance task
+        try:
+            from engine.governance import get_governance
+            _gov_tq = get_governance()
+            _gov_tq._record_proof(
+                "governance_task_published",
+                step="__governance__",
+                instance_id=instance.instance_id,
+                task_id=task_id,
+                queue_backend=self.tasks.backend_name,
+                task_type=task.task_type,
+                queue=gov_decision.queue,
+            )
+        except Exception:
+            pass
+
         self.store.log_action(
             instance_id=instance.instance_id,
             correlation_id=instance.correlation_id,
@@ -1135,6 +1131,7 @@ class Coordinator:
                 "reason": gov_decision.reason,
                 "resume_nonce": suspension.resume_nonce,
                 "task_id": task_id,
+                "queue_backend": self.tasks.backend_name,
             },
         )
 
