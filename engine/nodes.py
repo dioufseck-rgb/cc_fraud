@@ -41,6 +41,7 @@ from engine.state import (
     resolve_param,
     build_context_from_state,
 )
+from engine.governance import get_governance
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +403,16 @@ def create_node(
         t0 = time.time()
 
         messages = [HumanMessage(content=rendered_prompt)]
-        response = llm.invoke(messages)
-        raw_response = response.content
+        gov = get_governance()
+        _gov_result = gov.protected_llm_call(
+            llm=llm,
+            prompt=rendered_prompt,
+            step_name=step_name,
+            domain=state.get("metadata", {}).get("domain", ""),
+            model=model,
+            case_input=state.get("input", {}),
+        )
+        raw_response = _gov_result.raw_response
 
         elapsed = time.time() - t0
         get_trace().on_llm_end(step_name, len(raw_response), elapsed)
@@ -781,8 +790,16 @@ def create_retrieve_node(
 
         get_trace().on_llm_start(step_name, len(rendered_prompt))
         t0 = time.time()
-        response = llm.invoke([HumanMessage(content=rendered_prompt)])
-        raw_response = response.content
+        gov = get_governance()
+        _gov_result = gov.protected_llm_call(
+            llm=llm,
+            prompt=rendered_prompt,
+            step_name=step_name,
+            domain=state.get("metadata", {}).get("domain", ""),
+            model=model,
+            case_input=state.get("input", {}),
+        )
+        raw_response = _gov_result.raw_response
         elapsed = time.time() - t0
         get_trace().on_llm_end(step_name, len(raw_response), elapsed)
 
@@ -892,6 +909,35 @@ def create_act_node(
 
         get_trace().on_step_start(step_name, "act", iteration)
 
+        # ── Shadow mode check ──
+        _gov_shadow = get_governance()
+        if _gov_shadow.should_skip_act(step_name):
+            _gov_shadow.record_shadow_act(
+                instance_id=state.get("metadata", {}).get("instance_id", ""),
+                step_name=step_name,
+                proposed_actions=[],
+            )
+            step_result: StepResult = {
+                "step_name": step_name,
+                "primitive": "act",
+                "output": {
+                    "shadow": True,
+                    "mode": "shadow",
+                    "actions_taken": [],
+                    "confidence": 1.0,
+                    "reasoning": "Shadow mode active — Act skipped, intent logged.",
+                    "evidence_used": [],
+                    "evidence_missing": [],
+                },
+                "raw_response": "",
+                "prompt_used": "",
+            }
+            return {
+                "steps": [step_result],
+                "current_step": step_name,
+                "loop_counts": current_counts,
+            }
+
         # Resolve params
         resolved = {}
         for key, value in params.items():
@@ -925,8 +971,16 @@ def create_act_node(
         rendered_prompt = render_prompt("act", resolved)
         get_trace().on_llm_start(step_name, len(rendered_prompt))
         t0 = time.time()
-        response = llm.invoke([HumanMessage(content=rendered_prompt)])
-        raw_response = response.content
+        gov = get_governance()
+        _gov_result = gov.protected_llm_call(
+            llm=llm,
+            prompt=rendered_prompt,
+            step_name=step_name,
+            domain=state.get("metadata", {}).get("domain", ""),
+            model=model,
+            case_input=state.get("input", {}),
+        )
+        raw_response = _gov_result.raw_response
         elapsed = time.time() - t0
         get_trace().on_llm_end(step_name, len(raw_response), elapsed)
 
@@ -1003,7 +1057,18 @@ def create_act_node(
                     action_spec["confirmation_id"] = result.confirmation_id
                     action_spec["response_data"] = result.response_data
                 else:
+                    # Register compensation before execution so it can be reversed on failure
+                    _idem_key = f"{state.get('metadata', {}).get('instance_id', '')}:{step_name}:{action_name}"
+                    gov.register_compensation(
+                        instance_id=state.get("metadata", {}).get("instance_id", ""),
+                        step_name=step_name,
+                        action_description=f"{action_name} on {exec_params}",
+                        compensation_data={"action": action_name, "params": exec_params},
+                        idempotency_key=_idem_key,
+                    )
                     result = action_registry.execute(action_name, exec_params, dry_run=False)
+                    if result.status == "success":
+                        gov.confirm_compensation(idempotency_key=_idem_key)
                     action_spec["status"] = result.status
                     action_spec["confirmation_id"] = result.confirmation_id
                     action_spec["response_data"] = result.response_data
@@ -1112,12 +1177,20 @@ Respond ONLY with JSON."""
 
     get_trace().on_llm_start(f"retrieval_planner({step_name})", len(prompt))
     t0 = time.time()
-    response = llm.invoke([HumanMessage(content=prompt)])
+    gov = get_governance()
+    _gov_result = gov.protected_llm_call(
+        llm=llm,
+        prompt=prompt,
+        step_name=step_name,
+        domain="",
+        model="default",
+    )
+    raw_response = _gov_result.raw_response
     elapsed = time.time() - t0
-    get_trace().on_llm_end(f"retrieval_planner({step_name})", len(response.content), elapsed)
+    get_trace().on_llm_end(f"retrieval_planner({step_name})", len(raw_response), elapsed)
 
     try:
-        parsed = extract_json(response.content)
+        parsed = extract_json(raw_response)
         sources = parsed.get("sources", [])
         valid = [s for s in sources if s in available_tools]
         return valid if valid else available_tools

@@ -311,6 +311,28 @@ class Coordinator:
         self._log(f"▶ START {instance.instance_id} "
                    f"({workflow_type}/{domain}) [tier={tier}]")
 
+        # ── Spec manifest — capture config hashes at instance start ──
+        try:
+            from engine.governance import get_governance
+            _gov = get_governance()
+            _wf_path = self.workflow_dir / f"{workflow_type}.yaml"
+            _dom_path = self.domain_dir / f"{domain}.yaml"
+            _manifest = _gov.capture_spec_manifest(
+                workflow_path=str(_wf_path),
+                domain_path=str(_dom_path),
+                coordinator_path="",
+            )
+            if _manifest:
+                self.store.log_action(
+                    instance_id=instance.instance_id,
+                    correlation_id=instance.correlation_id,
+                    action_type="spec_manifest",
+                    details=_manifest,
+                    idempotency_key=f"manifest:{instance.instance_id}",
+                )
+        except Exception as _e:
+            self._log(f"  ⚠ Spec manifest capture failed (non-blocking): {_e}")
+
         # When MCP is configured, strip pre-labeled fields so the LLM
         # cannot see the answer (fraud_type, description, etc.) before
         # it reasons. Child workflows triggered by delegation policies
