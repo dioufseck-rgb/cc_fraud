@@ -909,6 +909,10 @@ def create_act_node(
 
         get_trace().on_step_start(step_name, "act", iteration)
 
+        # ── Kill switch check ──
+        _gov_ks = get_governance()
+        _gov_ks.check_act_allowed()
+
         # ── Shadow mode check ──
         _gov_shadow = get_governance()
         if _gov_shadow.should_skip_act(step_name):

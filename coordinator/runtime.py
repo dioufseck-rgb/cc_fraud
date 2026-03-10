@@ -311,6 +311,25 @@ class Coordinator:
         self._log(f"▶ START {instance.instance_id} "
                    f"({workflow_type}/{domain}) [tier={tier}]")
 
+        # ── Start gates — kill switches, guardrails, eval gate ──
+        try:
+            from engine.governance import get_governance
+            _gov = get_governance()
+            _gate = _gov.check_start_gates(workflow_type, domain, case_input)
+            if _gate.get("blocked"):
+                self._on_failed(instance, f"Start gate blocked: {_gate.get('reason', '')}")
+                raise RuntimeError(f"Start gate blocked: {_gate.get('reason', '')}")
+            if _gate.get("tier_escalation"):
+                tier = self._resolve_governance_tier_upgrade(
+                    tier, _gate["tier_escalation"]
+                )
+                instance.governance_tier = tier
+                self.store.save_instance(instance)
+        except RuntimeError:
+            raise
+        except Exception as _e:
+            self._log(f"  ⚠ Start gates check failed (non-blocking): {_e}")
+
         # ── Spec manifest — capture config hashes at instance start ──
         try:
             from engine.governance import get_governance
@@ -363,8 +382,12 @@ class Coordinator:
                 self._on_interrupted(instance, result, model, temperature)
 
         except Exception as e:
-            self._on_failed(instance, str(e))
-            raise
+            from engine.kill_switch import KillSwitchTripped
+            if isinstance(e, KillSwitchTripped):
+                self._on_kill_switch_suspended(instance, str(e))
+            else:
+                self._on_failed(instance, str(e))
+                raise
 
         return instance.instance_id
 
@@ -1244,6 +1267,35 @@ class Coordinator:
         # complete — with combined results. No intermediate generate_final_report.
         if blocking_delegations:
             self._execute_all_blocking_delegations(instance, blocking_delegations, final_state)
+
+    def _on_kill_switch_suspended(self, instance: InstanceState, reason: str):
+        """Suspend workflow when a kill switch blocks Act execution."""
+        suspension = Suspension.create(
+            instance_id=instance.instance_id,
+            suspended_at_step="__kill_switch__",
+            state_snapshot={"kill_switch_reason": reason},
+        )
+        self.store.save_suspension(suspension)
+
+        instance.status = InstanceStatus.SUSPENDED
+        instance.updated_at = time.time()
+        instance.resume_nonce = suspension.resume_nonce
+        self.store.save_instance(instance)
+
+        self.store.log_action(
+            instance_id=instance.instance_id,
+            correlation_id=instance.correlation_id,
+            action_type="kill_switch_suspended",
+            details={"reason": reason},
+        )
+        self._log(f"  ⛔ SUSPENDED (kill switch) {instance.instance_id}: {reason}")
+
+    def _resolve_governance_tier_upgrade(self, current_tier: str, upgrade_to: str) -> str:
+        """Upgrade tier only — never downgrade."""
+        order = {"auto": 0, "gate": 1, "hold": 2}
+        if order.get(upgrade_to, 0) > order.get(current_tier, 0):
+            return upgrade_to
+        return current_tier
 
     def _on_failed(self, instance: InstanceState, error: str):
         """Handle workflow failure."""

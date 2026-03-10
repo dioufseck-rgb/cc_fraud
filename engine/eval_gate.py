@@ -39,6 +39,17 @@ from typing import Any
 logger = logging.getLogger("cognitive_core.eval_gate")
 
 
+class EvalGateNotPassedError(RuntimeError):
+    """Raised when the active model has no passing eval pack registered."""
+
+    def __init__(self, model_id: str, reason: str = ""):
+        self.model_id = model_id
+        msg = f"Eval gate not passed for model '{model_id}'"
+        if reason:
+            msg += f": {reason}"
+        super().__init__(msg)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Baseline
 # ═══════════════════════════════════════════════════════════════════
@@ -194,6 +205,26 @@ class EvalGate:
         with open(path, "w") as f:
             json.dump(baseline.to_dict(), f, indent=2)
         logger.info("Baseline saved: %s", path)
+
+    def is_model_approved(self, model_id: str) -> bool:
+        """
+        Check if a model has at least one passing eval baseline registered.
+
+        A model is considered approved when a baseline JSON exists in the
+        baselines directory that was authored by that model version.  Returns
+        True if found, False if no matching baseline exists.
+        """
+        if not self.baselines_dir.exists():
+            return False
+        for path in self.baselines_dir.glob("*.json"):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if data.get("model_version") == model_id:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def evaluate(
         self,

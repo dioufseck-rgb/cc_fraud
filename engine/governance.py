@@ -465,6 +465,34 @@ class GovernancePipeline:
             except Exception as e:
                 logger.warning("PII entity registration failed: %s", e)
 
+        # ── 4. Eval Gate — require passing eval pack for active model ──
+        enforced = os.environ.get("CC_EVAL_GATE_ENFORCED", "true").lower() != "false"
+        if not enforced:
+            logger.warning(
+                "⚠ CC_EVAL_GATE_ENFORCED=false — eval gate bypassed (dev override only)"
+            )
+        model_id = os.environ.get("LLM_MODEL_ID", "")
+        self._record_proof("eval_gate.checked",
+                           workflow=workflow_type, domain=domain,
+                           model=model_id, enforced=enforced)
+        if enforced and model_id:
+            try:
+                from engine.eval_gate import EvalGate, EvalGateNotPassedError
+                _gate = EvalGate()
+                if not _gate.is_model_approved(model_id):
+                    err = EvalGateNotPassedError(model_id)
+                    gate_result["blocked"] = True
+                    gate_result["reason"] = str(err)
+                    self._record_proof("eval_gate.blocked",
+                                       model=model_id, reason=str(err))
+                    return gate_result
+                self._record_proof("eval_gate.passed", model=model_id)
+            except Exception as e:
+                from engine.eval_gate import EvalGateNotPassedError
+                if isinstance(e, EvalGateNotPassedError):
+                    raise
+                logger.warning("Eval gate check error: %s", e)
+
         return gate_result
 
     def capture_spec_manifest(
@@ -665,12 +693,17 @@ class GovernancePipeline:
         """Record what Act would have done in shadow mode."""
         if self._shadow_mode:
             try:
-                self._shadow_mode.record_shadow_act(
+                proposed_action = proposed_actions[0] if proposed_actions else {}
+                record = self._shadow_mode.record_shadow_act(
                     instance_id=instance_id,
                     step_name=step_name,
-                    proposed_actions=proposed_actions,
+                    proposed_action=proposed_action,
                 )
-                return self._shadow_mode.get_shadow_result(step_name)
+                self._record_proof("act.shadow_recorded",
+                                   step=step_name, instance_id=instance_id)
+                return self._shadow_mode.get_shadow_result(step_name) if hasattr(
+                    self._shadow_mode, "get_shadow_result"
+                ) else {"shadow": True, "actions_taken": []}
             except Exception as e:
                 logger.warning("Shadow act recording failed: %s", e)
         return {"shadow": True, "actions_taken": []}
