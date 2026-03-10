@@ -352,6 +352,21 @@ class Coordinator:
         except Exception as _e:
             self._log(f"  ⚠ Spec manifest capture failed (non-blocking): {_e}")
 
+        # ── Analytics artifacts — load at workflow start, record provenance ──
+        try:
+            from engine.governance import get_governance
+            _gov = get_governance()
+            _dom_cfg = self._load_domain_config(domain)
+            _analytics_block = _dom_cfg.get("analytics", {})
+            _artifact_names = [
+                v["artifact"] for v in _analytics_block.values()
+                if isinstance(v, dict) and "artifact" in v
+            ]
+            if _artifact_names:
+                _gov.load_analytics_artifacts(domain, workflow_type, _artifact_names)
+        except Exception as _e:
+            self._log(f"  ⚠ Analytics artifact loading failed (non-blocking): {_e}")
+
         # When MCP is configured, strip pre-labeled fields so the LLM
         # cannot see the answer (fraud_type, description, etc.) before
         # it reasons. Child workflows triggered by delegation policies
@@ -3052,6 +3067,16 @@ class Coordinator:
         raise FileNotFoundError(
             f"Domain not found: {domain} (searched {self.domain_dir})"
         )
+
+    def _load_domain_config(self, domain: str) -> dict[str, Any]:
+        """Load full domain YAML config. Returns empty dict on error."""
+        try:
+            domain_path = self._find_domain(domain)
+            with open(domain_path) as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.warning("Failed to load domain config for '%s': %s", domain, e)
+            return {}
 
     def _resolve_governance_tier(self, domain: str) -> str:
         """Read governance tier from domain config. Cached."""

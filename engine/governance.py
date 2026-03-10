@@ -392,6 +392,59 @@ class GovernancePipeline:
         return result
 
     # ═══════════════════════════════════════════════════════════════
+    # Analytics Registry Loader
+    # Called from coordinator/runtime.py → start() after start gates
+    # ═══════════════════════════════════════════════════════════════
+
+    def load_analytics_artifacts(
+        self,
+        domain: str,
+        workflow_type: str,
+        artifact_names: list[str],
+    ) -> dict[str, Any]:
+        """
+        Load named analytics artifacts from the registry and record
+        analytics_artifact_loaded proof events for each.
+
+        Returns a dict of artifact_name → artifact config for loaded artifacts.
+        Artifacts that fail to load are skipped with a warning.
+        """
+        self.initialize()
+        loaded: dict[str, Any] = {}
+
+        try:
+            from analytics.registry import AnalyticsRegistry
+            reg = AnalyticsRegistry()
+        except Exception as e:
+            logger.warning("Analytics registry unavailable: %s", e)
+            return loaded
+
+        for name in artifact_names:
+            try:
+                artifact = reg.lookup(name)
+                loaded[name] = artifact
+                self._record_proof(
+                    "analytics_artifact_loaded",
+                    artifact_name=name,
+                    artifact_type=artifact.get("artifact_type"),
+                    version=artifact.get("version"),
+                    domain=domain,
+                    workflow=workflow_type,
+                )
+                logger.info("Analytics artifact loaded: %s", name)
+            except Exception as e:
+                logger.warning("Failed to load artifact '%s': %s", name, e)
+                self._record_proof(
+                    "analytics_fallback_applied",
+                    artifact_name=name,
+                    domain=domain,
+                    workflow=workflow_type,
+                    reason=str(e),
+                )
+
+        return loaded
+
+    # ═══════════════════════════════════════════════════════════════
     # CHOKEPOINT 2: Start Gates
     # Called from coordinator/runtime.py → start()
     # ═══════════════════════════════════════════════════════════════
